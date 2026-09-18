@@ -126,6 +126,13 @@ button.danger:hover { background: #8a2f3c; }
 .word-row.flash { animation: flash 0.5s ease; }
 @keyframes flash { from { background: #3d7bff44; } to { background: transparent; } }
 
+.words-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.follow-toggle {
+  font-size: 12px; padding: 6px 10px;
+}
+.follow-toggle.unlocked { background: #3d2f0f; border-color: #6b5220; color: #ffcf7a; }
+.follow-toggle.unlocked:hover { background: #4a3a13; }
+
 .modal {
   position: fixed; inset: 0; background: rgba(0,0,0,.55);
   display: flex; align-items: center; justify-content: center; z-index: 50;

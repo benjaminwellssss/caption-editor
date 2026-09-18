@@ -13,6 +13,7 @@ const state = {
   dragging: false,
   selection: new Set(), // selected card indices
   lastSelectedIdx: null,
+  followVideo: true, // when true, the caption list auto-scrolls to track the current word
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -466,8 +467,10 @@ function assignSpeaker(name) {
   pushUndo({ type: "speaker", idx, prev, next: name });
   markDirty();
   refreshRow(idx);
-  const row = $(`.word-row[data-idx="${idx}"]`);
-  if (row) row.scrollIntoView({ block: "nearest" });
+  if (state.followVideo) {
+    const row = $(`.word-row[data-idx="${idx}"]`);
+    if (row) row.scrollIntoView({ block: "nearest" });
+  }
 }
 
 // ---------- playback ----------
@@ -538,7 +541,9 @@ function updateOverlay() {
   const row = $(`.word-row[data-idx="${idx}"]`);
   if (row) {
     row.classList.add("current");
-    row.scrollIntoView({ block: "center", behavior: "smooth" });
+    // Still marked so you can find the live word by eye while browsing,
+    // just doesn't yank the list to it unless following is turned on.
+    if (state.followVideo) row.scrollIntoView({ block: "center", behavior: "smooth" });
   }
 }
 
