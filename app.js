@@ -257,6 +257,15 @@ $("#spDelete").addEventListener("click", () => {
   closeSpeakerModal();
 });
 
+// ---------- follow-video toggle ----------
+
+$("#followToggle").addEventListener("click", () => {
+  state.followVideo = !state.followVideo;
+  const btn = $("#followToggle");
+  btn.textContent = state.followVideo ? "🔒 Following video" : "🔓 Free scroll";
+  btn.classList.toggle("unlocked", !state.followVideo);
+});
+
 // ---------- words panel & selection ----------
 
 function renderWords() {
@@ -267,11 +276,60 @@ function renderWords() {
     row.className = "word-row" + (state.selection.has(idx) ? " selected" : "");
     row.dataset.idx = idx;
 
-    const ts = document.createElement("span");
-    ts.className = "ts";
-    ts.textContent = fmtTime(card.start);
-    ts.title = "Jump to this word";
-    ts.onclick = (e) => { e.stopPropagation(); video().currentTime = card.start; };
+    const handle = document.createElement("span");
+    handle.className = "row-handle";
+    handle.textContent = "☰";
+    handle.title = "Click to select — drag for a range, Shift-click to extend, Ctrl-click to add/remove one";
+    handle.addEventListener("mousedown", (e) => onHandleMouseDown(e, idx));
+    handle.addEventListener("mouseenter", () => onHandleMouseEnter(idx));
+
+    const seekBtn = document.createElement("button");
+    seekBtn.className = "seek-btn";
+    seekBtn.textContent = "▶";
+    seekBtn.title = "Jump video to this word's start";
+    seekBtn.addEventListener("click", (e) => { e.stopPropagation(); video().currentTime = card.start; });
+
+    const startInput = document.createElement("input");
+    startInput.type = "number";
+    startInput.step = "0.01";
+    startInput.className = "time-input start-time";
+    startInput.value = card.start.toFixed(3);
+    startInput.title = "Start time (seconds)";
+    startInput.addEventListener("click", (e) => e.stopPropagation());
+    startInput.addEventListener("change", () => {
+      const next = parseFloat(startInput.value);
+      if (isNaN(next) || next >= card.end) {
+        startInput.value = card.start.toFixed(3);
+        return;
+      }
+      const prev = card.start;
+      card.start = next;
+      pushUndo({ type: "timing", idx, field: "start", prev, next });
+      markDirty();
+    });
+
+    const sep = document.createElement("span");
+    sep.className = "time-sep";
+    sep.textContent = "–";
+
+    const endInput = document.createElement("input");
+    endInput.type = "number";
+    endInput.step = "0.01";
+    endInput.className = "time-input end-time";
+    endInput.value = card.end.toFixed(3);
+    endInput.title = "End time (seconds)";
+    endInput.addEventListener("click", (e) => e.stopPropagation());
+    endInput.addEventListener("change", () => {
+      const next = parseFloat(endInput.value);
+      if (isNaN(next) || next <= card.start) {
+        endInput.value = card.end.toFixed(3);
+        return;
+      }
+      const prev = card.end;
+      card.end = next;
+      pushUndo({ type: "timing", idx, field: "end", prev, next });
+      markDirty();
+    });
 
     const text = document.createElement("input");
     text.className = "text";
@@ -293,20 +351,139 @@ function renderWords() {
     const sp = card.speaker ? speakerByName(card.speaker) : null;
     if (sp) { badge.style.background = sp.color; badge.style.color = "#101215"; }
 
-    const handle = document.createElement("span");
-    handle.className = "row-handle";
-    handle.textContent = "☰";
-    handle.title = "Click to select — drag for a range, Shift-click to extend, Ctrl-click to add/remove one";
-    handle.addEventListener("mousedown", (e) => onHandleMouseDown(e, idx));
-    handle.addEventListener("mouseenter", () => onHandleMouseEnter(idx));
+    const emojiBtn = document.createElement("button");
+    emojiBtn.className = "row-icon-btn";
+    emojiBtn.textContent = "😀";
+    emojiBtn.title = "Insert emoji";
+    emojiBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openEmojiPicker(emojiBtn, text);
+    });
+
+    const insertBtn = document.createElement("button");
+    insertBtn.className = "row-icon-btn";
+    insertBtn.textContent = "+";
+    insertBtn.title = "Insert a new blank caption after this one";
+    insertBtn.addEventListener("click", (e) => { e.stopPropagation(); insertCardAfter(idx); });
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "row-icon-btn danger";
+    deleteBtn.textContent = "✕";
+    deleteBtn.title = "Delete this caption";
+    deleteBtn.addEventListener("click", (e) => { e.stopPropagation(); deleteCard(idx); });
 
     row.appendChild(handle);
-    row.appendChild(ts);
+    row.appendChild(seekBtn);
+    row.appendChild(startInput);
+    row.appendChild(sep);
+    row.appendChild(endInput);
     row.appendChild(text);
     row.appendChild(badge);
+    row.appendChild(emojiBtn);
+    row.appendChild(insertBtn);
+    row.appendChild(deleteBtn);
     list.appendChild(row);
   });
 }
+
+// ---------- insert / delete captions ----------
+
+function insertCardAt(idx, start, end) {
+  state.cards.splice(idx, 0, { start, end, lines: [""], speaker: null });
+  pushUndo({ type: "insert", idx });
+  markDirty();
+  clearSelection();
+  renderWords();
+  const row = $(`.word-row[data-idx="${idx}"]`);
+  if (row) {
+    row.scrollIntoView({ block: "center" });
+    row.querySelector(".text").focus();
+  }
+}
+
+function insertCardAfter(idx) {
+  const card = state.cards[idx];
+  const next = state.cards[idx + 1];
+  const start = card.end;
+  let end = start + 0.3;
+  if (next) end = Math.min(end, next.start);
+  end = Math.max(end, start + 0.05);
+  insertCardAt(idx + 1, start, end);
+}
+
+function insertCardAtTime(t) {
+  let idx = state.cards.findIndex((c) => c.start > t);
+  if (idx === -1) idx = state.cards.length;
+  const next = state.cards[idx];
+  let end = t + 0.3;
+  if (next) end = Math.min(end, next.start);
+  end = Math.max(end, t + 0.05);
+  insertCardAt(idx, t, end);
+}
+
+function deleteCard(idx) {
+  const [removed] = state.cards.splice(idx, 1);
+  pushUndo({ type: "delete", idx, card: removed });
+  markDirty();
+  clearSelection();
+  renderWords();
+}
+
+$("#addCaptionBtn").addEventListener("click", () => insertCardAtTime(video().currentTime));
+
+// ---------- emoji picker ----------
+
+const EMOJI_SET = [
+  "😀", "😂", "😭", "😱", "😡", "🤔", "😴", "😎", "🥵", "🥶", "😈", "👀",
+  "💀", "🔥", "💯", "👍", "👎", "👏", "🙌", "🤝", "🙏", "💪", "🤡", "🎮",
+  "🎉", "🎂", "🍻", "🍺", "💰", "🪓", "⚔️", "🛡️", "🏆", "⭐", "✨", "💥",
+  "⚡", "❤️", "💚", "💛", "💙", "💜", "🖤", "🤍", "🚫", "❌", "✅", "❓",
+  "❗", "😅", "🤯", "🫡",
+];
+
+const emojiPickerEl = $("#emojiPicker");
+let emojiTargetInput = null;
+
+EMOJI_SET.forEach((em) => {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = em;
+  btn.addEventListener("click", (e) => { e.stopPropagation(); insertEmoji(em); });
+  emojiPickerEl.appendChild(btn);
+});
+
+function openEmojiPicker(triggerBtn, targetInput) {
+  emojiTargetInput = targetInput;
+  const rect = triggerBtn.getBoundingClientRect();
+  emojiPickerEl.style.left = Math.min(rect.left, window.innerWidth - 290) + "px";
+  emojiPickerEl.style.top = (rect.bottom + 4) + "px";
+  emojiPickerEl.classList.remove("hidden");
+}
+
+function closeEmojiPicker() {
+  emojiPickerEl.classList.add("hidden");
+  emojiTargetInput = null;
+}
+
+function insertEmoji(em) {
+  if (!emojiTargetInput) return;
+  const input = emojiTargetInput;
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  input.value = input.value.slice(0, start) + em + input.value.slice(end);
+  const newPos = start + em.length;
+  input.focus();
+  input.setSelectionRange(newPos, newPos);
+  // reuses the existing "change" listener's prev/next diff + undo push
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  closeEmojiPicker();
+}
+
+document.addEventListener("click", (e) => {
+  if (!emojiPickerEl.classList.contains("hidden") && !emojiPickerEl.contains(e.target)) {
+    closeEmojiPicker();
+  }
+});
 
 // ---------- drag-to-select (via the row-handle grip only, never the text
 // or timestamp, so a selection drag can't turn into a native text
@@ -391,6 +568,8 @@ function refreshRow(idx) {
   if (!row) return;
   const card = state.cards[idx];
   row.querySelector(".text").value = card.lines[0] || "";
+  row.querySelector(".start-time").value = card.start.toFixed(3);
+  row.querySelector(".end-time").value = card.end.toFixed(3);
   const badge = row.querySelector(".speaker-badge");
   badge.textContent = card.speaker || "—";
   badge.className = "speaker-badge" + (card.speaker ? "" : " unassigned");
@@ -421,6 +600,17 @@ function undoLast() {
       state.cards[item.idx].speaker = item.prev;
       refreshRow(item.idx);
     }
+  } else if (action.type === "timing") {
+    state.cards[action.idx][action.field] = action.prev;
+    refreshRow(action.idx);
+  } else if (action.type === "insert") {
+    state.cards.splice(action.idx, 1);
+    clearSelection();
+    renderWords();
+  } else if (action.type === "delete") {
+    state.cards.splice(action.idx, 0, action.card);
+    clearSelection();
+    renderWords();
   }
   markDirty(state.undoStack.length > 0 || state.dirty);
 }
@@ -570,6 +760,14 @@ $("#seekBar").addEventListener("change", () => { state.dragging = false; });
 // ---------- save ----------
 
 $("#saveBtn").addEventListener("click", async () => {
+  const emptyCount = state.cards.filter((c) => !(c.lines[0] || "").trim()).length;
+  if (emptyCount > 0) {
+    const proceed = confirm(
+      `${emptyCount} caption${emptyCount > 1 ? "s have" : " has"} no text — an empty caption ` +
+      `will break the render. Save anyway? (Cancel to go back and fill it in or delete it.)`
+    );
+    if (!proceed) return;
+  }
   if (!state.speakersHandle) {
     try {
       state.speakersHandle = await window.showSaveFilePicker({
