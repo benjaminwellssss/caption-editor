@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Caption Speaker Editor</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="setup" class="panel">
+  <h1>Caption Speaker Editor</h1>
+  <p class="hint">Pick a video file and its caption cards (and optionally an existing speakers config to reuse names/keys/colors across jobs). File dialogs are your normal Windows Explorer picker.</p>
+  <p id="fsaWarning" class="error hidden">This browser doesn't support native file picking (needs Chrome or Edge on Windows).</p>
+
+  <div class="picker-row">
+    <label>Video file</label>
+    <span id="videoPathLabel" class="picked-name">no file chosen</span>
+    <button data-pick="video">Choose…</button>
+  </div>
+  <div class="picker-row">
+    <label>Captions (cards.json)</label>
+    <span id="cardsPathLabel" class="picked-name">no file chosen</span>
+    <button data-pick="cards">Choose…</button>
+  </div>
+  <div class="picker-row">
+    <label>Speakers config <span class="hint">(optional — reuse from another job)</span></label>
+    <span id="speakersPathLabel" class="picked-name">none — will prompt to create on first save</span>
+    <button data-pick="speakers">Choose…</button>
+  </div>
+
+  <button id="loadBtn" class="primary">Load</button>
+  <div id="setupError" class="error"></div>
+</div>
+
+<div id="editor" class="panel hidden">
+  <div class="top-bar">
+    <div id="projectLabel" class="project-label"></div>
+    <div class="spacer"></div>
+    <span id="dirtyFlag" class="dirty-flag hidden">unsaved changes</span>
+    <button id="saveBtn" class="primary">Save</button>
+    <button id="backToSetupBtn">Load different files</button>
+  </div>
+
+  <div class="main-grid">
+    <div class="video-col">
+      <div class="video-wrap">
+        <video id="video" preload="metadata"></video>
+        <div id="overlay" class="overlay"></div>
+      </div>
+      <div class="transport">
+        <input id="seekBar" type="range" min="0" max="1000" value="0" step="1">
+        <span id="timeLabel">0:00 / 0:00</span>
+      </div>
+      <div class="hotkey-help">
+        <b>Space</b> play/pause &nbsp; <b>&lt;</b> -5s &nbsp; <b>&gt;</b> +5s &nbsp;
+        <b>Enter</b> restart (keeps data) &nbsp; <b>Backspace</b> undo last &nbsp;<br>
+drag the <b>☰</b> handle to select a range, click one to select just that word, <b>Shift</b>-click a handle to extend to it, <b>Ctrl</b>-click to add/remove one &nbsp;
+        press a speaker key to tag the current word (or the whole selection, which then clears) &nbsp; <b>Esc</b> clear selection
+      </div>
+      <div id="selectionStatus" class="selection-status hidden"></div>
+
+      <div class="speakers-panel">
+        <div class="speakers-header">
+          <h3>Speakers</h3>
+          <button id="addSpeakerBtn">+ Add</button>
+        </div>
+        <div id="speakersList" class="speakers-list"></div>
+      </div>
+    </div>
+
+    <div class="words-col">
+      <div id="wordsList" class="words-list"></div>
+    </div>
+  </div>
+</div>
+
+<div id="speakerModal" class="modal hidden">
+  <div class="modal-box small">
+    <div class="modal-header">
+      <span id="speakerModalTitle">Add speaker</span>
+      <button id="speakerModalClose">×</button>
+    </div>
+    <div class="speaker-form">
+      <label>Name <input id="spName" type="text" maxlength="40"></label>
+      <label>Hotkey <input id="spKey" type="text" maxlength="1"></label>
+      <label>Color <input id="spColor" type="color" value="#8cff78"></label>
+      <div id="speakerFormError" class="error"></div>
+      <div class="speaker-form-actions">
+        <button id="spDelete" class="danger hidden">Delete</button>
+        <div class="spacer"></div>
+        <button id="spCancel">Cancel</button>
+        <button id="spSave" class="primary">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
