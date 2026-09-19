@@ -56,7 +56,11 @@ button.danger:hover { background: #8a2f3c; }
   pointer-events: none; font-family: Impact, "Arial Black", sans-serif;
   font-size: 54px; font-weight: 900; -webkit-text-stroke: 3px #000;
   paint-order: stroke fill; text-shadow: 4px 4px 0 #000;
-  letter-spacing: .01em;
+  letter-spacing: .01em; white-space: pre-line;
+}
+.note-chip {
+  flex-shrink: 0; font-size: 11px; padding: 2px 7px; border-radius: 10px;
+  background: #3d2f0f; color: #ffcf7a; border: 1px solid #6b5220; cursor: help;
 }
 
 .transport { display: flex; align-items: center; gap: 10px; margin-top: 8px; }

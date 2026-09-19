@@ -57,6 +57,37 @@ function speakerByName(name) {
   return state.speakers.find((s) => s.name === name);
 }
 
+// ---------- editor text syntax ----------
+// What you type in a caption's text box:
+//   *like this*  -> an editor note (instructions for whoever renders the
+//                   video). Saved in card.note, never part of the caption.
+//   |            -> a line break: "HECK|YES" shows HECK above YES.
+// card.lines holds only what is displayed; card.note holds the notes.
+
+function parseEditorText(raw) {
+  const notes = [];
+  const withoutNotes = raw.replace(/\*([^*]*)\*/g, (_, n) => {
+    if (n.trim()) notes.push(n.trim());
+    return " ";
+  });
+  const lines = withoutNotes.split("|").map((l) => l.replace(/\s+/g, " ").trim());
+  while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  while (lines.length > 1 && lines[0] === "") lines.shift();
+  return { lines, note: notes.length ? notes.join("; ") : null };
+}
+
+function cardEditorText(card) {
+  const shown = card.lines.join("|");
+  return card.note ? `${shown} *${card.note}*` : shown;
+}
+
+function applyEditorText(card, raw) {
+  const parsed = parseEditorText(raw);
+  card.lines = parsed.lines;
+  if (parsed.note) card.note = parsed.note;
+  else delete card.note;
+}
+
 function markDirty(v = true) {
   state.dirty = v;
   $("#dirtyFlag").classList.toggle("hidden", !v);
@@ -137,12 +168,21 @@ async function loadProject() {
     return;
   }
 
-  state.cards = cards.map((c) => ({ ...c, speaker: c.speaker || null }));
+  // Files saved by an older version of this editor can have "*note*" typed
+  // straight into the caption text — pull those out into card.note now.
+  let migrated = false;
+  state.cards = cards.map((c) => {
+    const card = { ...c, lines: [...c.lines], speaker: c.speaker || null };
+    const before = JSON.stringify([card.lines, card.note || null]);
+    applyEditorText(card, cardEditorText(card));
+    if (JSON.stringify([card.lines, card.note || null]) !== before) migrated = true;
+    return card;
+  });
   state.speakers = speakers;
   state.undoStack = [];
   state.selection = new Set();
   state.lastSelectedIdx = null;
-  markDirty(false);
+  markDirty(migrated);
 
   if (state.videoObjectUrl) URL.revokeObjectURL(state.videoObjectUrl);
   const videoFile = await state.videoHandle.getFile();
@@ -334,16 +374,22 @@ function renderWords() {
     const text = document.createElement("input");
     text.className = "text";
     text.type = "text";
-    text.value = card.lines[0] || "";
+    text.value = cardEditorText(card);
+    text.title = "*note* = editor note (not shown in the video)   |  = line break";
     text.addEventListener("click", (e) => e.stopPropagation());
     text.addEventListener("change", () => {
-      const prev = card.lines[0];
+      const prev = cardEditorText(card);
       const next = text.value;
       if (prev === next) return;
-      card.lines[0] = next;
-      pushUndo({ type: "text", idx, prev, next });
+      applyEditorText(card, next);
+      text.value = cardEditorText(card); // show the canonical form (notes tidied to the end)
+      pushUndo({ type: "text", idx, prev, next: text.value });
+      updateNoteChip(text.closest(".word-row"), card);
       markDirty();
     });
+
+    const noteChip = document.createElement("span");
+    noteChip.className = "note-chip hidden";
 
     const badge = document.createElement("span");
     badge.className = "speaker-badge" + (card.speaker ? "" : " unassigned");
@@ -378,12 +424,22 @@ function renderWords() {
     row.appendChild(sep);
     row.appendChild(endInput);
     row.appendChild(text);
+    row.appendChild(noteChip);
     row.appendChild(badge);
     row.appendChild(emojiBtn);
     row.appendChild(insertBtn);
     row.appendChild(deleteBtn);
     list.appendChild(row);
+    updateNoteChip(row, card);
   });
+}
+
+function updateNoteChip(row, card) {
+  if (!row) return;
+  const chip = row.querySelector(".note-chip");
+  chip.classList.toggle("hidden", !card.note);
+  chip.textContent = card.note ? "📝 note" : "";
+  chip.title = card.note || "";
 }
 
 // ---------- insert / delete captions ----------
@@ -567,7 +623,8 @@ function refreshRow(idx) {
   const row = $(`.word-row[data-idx="${idx}"]`);
   if (!row) return;
   const card = state.cards[idx];
-  row.querySelector(".text").value = card.lines[0] || "";
+  row.querySelector(".text").value = cardEditorText(card);
+  updateNoteChip(row, card);
   row.querySelector(".start-time").value = card.start.toFixed(3);
   row.querySelector(".end-time").value = card.end.toFixed(3);
   const badge = row.querySelector(".speaker-badge");
@@ -593,7 +650,7 @@ function undoLast() {
     state.cards[action.idx].speaker = action.prev;
     refreshRow(action.idx);
   } else if (action.type === "text") {
-    state.cards[action.idx].lines[0] = action.prev;
+    applyEditorText(state.cards[action.idx], action.prev);
     refreshRow(action.idx);
   } else if (action.type === "speaker-batch") {
     for (const item of action.items) {
@@ -723,7 +780,7 @@ function updateOverlay() {
     return;
   }
   const card = state.cards[idx];
-  overlay.textContent = (card.lines[0] || "").toUpperCase();
+  overlay.textContent = card.lines.join("\n").toUpperCase();
   const sp = card.speaker ? speakerByName(card.speaker) : null;
   overlay.style.color = sp ? sp.color : "#ffffff";
 
@@ -760,7 +817,15 @@ $("#seekBar").addEventListener("change", () => { state.dragging = false; });
 // ---------- save ----------
 
 $("#saveBtn").addEventListener("click", async () => {
-  const emptyCount = state.cards.filter((c) => !(c.lines[0] || "").trim()).length;
+  const strayStar = state.cards.filter((c) => c.lines.some((l) => l.includes("*"))).length;
+  if (strayStar > 0) {
+    const proceed = confirm(
+      `${strayStar} caption${strayStar > 1 ? "s contain" : " contains"} a lone * that isn't closed — ` +
+      `it would show up in the video. Close it as *note* or remove it. Save anyway?`
+    );
+    if (!proceed) return;
+  }
+  const emptyCount = state.cards.filter((c) => !c.lines.join("").trim()).length;
   if (emptyCount > 0) {
     const proceed = confirm(
       `${emptyCount} caption${emptyCount > 1 ? "s have" : " has"} no text — an empty caption ` +
@@ -786,7 +851,11 @@ $("#saveBtn").addEventListener("click", async () => {
   }
 
   const bakedCards = state.cards.map((c) => {
-    const out = { start: c.start, end: c.end, lines: c.lines };
+    // Carry through any field the editor doesn't manage (fx, emphasis_scale,
+    // ...) so saving never silently strips data another tool put on a card.
+    const { speaker: _s, fill: _f, note: _n, ...passthrough } = c;
+    const out = { ...passthrough, start: c.start, end: c.end, lines: c.lines };
+    if (c.note) out.note = c.note;
     if (c.speaker) {
       out.speaker = c.speaker;
       const sp = speakerByName(c.speaker);
