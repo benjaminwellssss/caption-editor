@@ -56,7 +56,8 @@
         <b>Enter</b> restart (keeps data) &nbsp; <b>Backspace</b> undo last &nbsp;<br>
 drag the <b>☰</b> handle to select a range, click one to select just that word, <b>Shift</b>-click a handle to extend to it, <b>Ctrl</b>-click to add/remove one &nbsp;
         press a speaker key to tag the current word (or the whole selection, which then clears) &nbsp; <b>Esc</b> clear selection<br>
-        each row: <b>▶</b> seek, start/end time (seconds, editable), <b>😀</b> insert emoji, <b>+</b> insert a blank caption after it, <b>✕</b> delete it<br>
+        each row: <b>▶</b> seek, start/end time (seconds, editable), <b>T1/T2…</b> which timeline it's on, <b>😀</b> insert emoji, <b>+</b> insert a blank caption after it, <b>✕</b> delete it<br>
+        <b>🕒+ Timeline</b> adds another lane so captions can overlap: the main timeline shows big, extra ones stack smaller beneath it (several speakers at once)<br>
         in a caption's text: <b>*like this*</b> = editor note (an instruction, <i>never shown</i> in the video) &nbsp; <b>|</b> = line break (<b>HECK|YES</b> puts YES under HECK)
       </div>
       <div id="selectionStatus" class="selection-status hidden"></div>
@@ -71,6 +72,16 @@ drag the <b>☰</b> handle to select a range, click one to select just that word
     </div>
 
     <div class="words-col">
+      <div class="timeline-panel">
+        <div class="tl-header">
+          <h3>Timelines</h3>
+          <span class="tl-hint">drag a caption to slide it · drag its edges to resize · <b>←/→</b> bump 1 frame (<b>Shift</b> = 10) · <b>↑/↓</b> change timeline · <b>Alt</b>-drag = no snapping · <b>Ctrl</b>+wheel zooms</span>
+          <button id="tlZoomOut" title="Zoom out">−</button>
+          <button id="tlZoomIn" title="Zoom in">+</button>
+          <button id="addLaneBtn" title="Add another timeline, so captions can overlap (several speakers at once)">🕒+ Timeline</button>
+        </div>
+        <div id="tlScroll" class="tl-scroll"><div id="tlContent" class="tl-content"></div></div>
+      </div>
       <div class="words-header">
         <h3>Captions</h3>
         <button id="addCaptionBtn" title="Insert a new blank caption at the current playhead time">+ Add caption</button>

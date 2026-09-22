@@ -34,6 +34,32 @@ shake and vibrate, scaled by words like *gentle*, *very*, *extremely*,
 for one it can't do, so nothing is silently ignored. Effects apply to the card
 the note is on, and only to the captions — not the video.
 
+## Timelines (simultaneous captions)
+
+The **Timelines** panel above the caption list shows every caption as a block
+on a time ruler, with a red playhead. It starts with one timeline;
+**🕒+ Timeline** adds another lane, so captions can overlap in time — put a
+second (third…) speaker on their own timeline and they show at the same moment.
+In the video, **Timeline 1 is the big main caption** and each further timeline
+stacks **smaller underneath** it (that's what the renderer draws, and what the
+live preview shows). Each caption is colored by its speaker.
+
+- **Slide:** drag a block left/right (it snaps to frames; hold **Alt** for free
+  movement). Drag it up/down to move it to another timeline. With several
+  captions selected, dragging any one moves them all together.
+- **Resize:** drag a block's left or right edge.
+- **Bump with the keyboard:** select caption(s) (click a block, or use the ☰
+  handle in the list), then **←/→** moves them one frame (**Shift** = ten
+  frames) and **↑/↓** moves them up/down a timeline. Holding a key is a single
+  undo step.
+- **Scrub:** click or drag on the ruler (or an empty part of a lane) to move the
+  video there; a plain click on a block cues the video to its start.
+- **Zoom:** the −/+ buttons, or **Ctrl**+mouse wheel.
+- **Which timeline "+ Add caption" uses:** click a timeline's label (it turns
+  blue). The **T1/T2…** menu on each list row also moves a caption between
+  timelines. The **✕** on the last timeline's label removes it (its captions
+  move up one).
+
 ## Controls
 
 - **Space** play/pause · **<** / **>** back / forward 5 s · **Enter** restart
@@ -62,4 +88,8 @@ the note is on, and only to the captions — not the video.
 
 `fill` (the speaker's color) is written from the speakers file each time you
 save, so recoloring a speaker recolors all their words. `note` appears only on
-cards that have one. Unknown fields are passed through untouched.
+cards that have one. `lane` (0-based; omitted for the main timeline) says which
+timeline a caption is on — so a two-timeline file has some cards with
+`"lane": 1`. Cards are saved sorted by start time. Unknown fields are passed
+through untouched. (A timeline you've added but not put any caption on isn't
+stored in the file, so it won't come back after a reload.)

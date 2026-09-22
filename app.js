@@ -1,20 +1,30 @@
 "use strict";
 
+const FPS = 30;              // frame step for snapping and arrow-key bumps
+const LABEL_W = 96;          // width of the lane-label column in the timeline (matches style.css)
+
 const state = {
   videoHandle: null,
   cardsHandle: null,
   speakersHandle: null, // may be null until first save, then remembered
   videoObjectUrl: null,
-  cards: [],       // [{start, end, lines:[text], speaker: name|null, fill?: [r,g,b,a]}]
+  // Kept sorted by (start, lane). Every card carries a runtime-only _id so
+  // selection and undo survive re-sorting; _id is never saved.
+  // {_id, start, end, lines:[text], lane?, speaker: name|null, fill?, note?}
+  cards: [],
   speakers: [],    // [{name, key, color}]  color = "#rrggbb"
   undoStack: [],
   dirty: false,
   editingSpeakerIdx: null, // index into state.speakers, or null for "adding new"
-  dragging: false,
-  selection: new Set(), // selected card indices
-  lastSelectedIdx: null,
-  followVideo: true, // when true, the caption list auto-scrolls to track the current word
+  dragging: false,         // seek bar being dragged
+  selection: new Set(),    // selected card _ids
+  lastSelectedId: null,
+  followVideo: true,       // list + timeline follow the playing word
+  laneCount: 1,            // simultaneous-caption timelines (lane 0 = main)
+  activeLane: 0,           // where "+ Add caption" puts a new caption
+  pps: 80,                 // timeline zoom, pixels per second
 };
+let nextId = 1;
 
 const $ = (sel) => document.querySelector(sel);
 const video = () => $("#video");
@@ -56,6 +66,17 @@ function hexToRgba(hex) {
 function speakerByName(name) {
   return state.speakers.find((s) => s.name === name);
 }
+
+const laneOf = (card) => card.lane || 0;
+const cardById = (id) => state.cards.find((c) => c._id === id);
+const idxById = (id) => state.cards.findIndex((c) => c._id === id);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function sortCards() {
+  state.cards.sort((a, b) => a.start - b.start || laneOf(a) - laneOf(b));
+}
+
+const orderKey = () => state.cards.map((c) => c._id).join(",");
 
 // ---------- editor text syntax ----------
 // What you type in a caption's text box:
@@ -172,16 +193,20 @@ async function loadProject() {
   // straight into the caption text — pull those out into card.note now.
   let migrated = false;
   state.cards = cards.map((c) => {
-    const card = { ...c, lines: [...c.lines], speaker: c.speaker || null };
+    const card = { ...c, _id: nextId++, lines: [...c.lines], speaker: c.speaker || null };
+    if (card.lane) card.lane = Math.max(0, Math.floor(card.lane)); else delete card.lane;
     const before = JSON.stringify([card.lines, card.note || null]);
     applyEditorText(card, cardEditorText(card));
     if (JSON.stringify([card.lines, card.note || null]) !== before) migrated = true;
     return card;
   });
+  sortCards();
+  state.laneCount = Math.max(1, ...state.cards.map((c) => laneOf(c) + 1));
+  state.activeLane = 0;
   state.speakers = speakers;
   state.undoStack = [];
   state.selection = new Set();
-  state.lastSelectedIdx = null;
+  state.lastSelectedId = null;
   markDirty(migrated);
 
   if (state.videoObjectUrl) URL.revokeObjectURL(state.videoObjectUrl);
@@ -197,6 +222,7 @@ async function loadProject() {
 
   renderSpeakers();
   renderWords();
+  renderTimeline();
   renderSelectionStatus();
 }
 
@@ -205,6 +231,8 @@ $("#backToSetupBtn").addEventListener("click", () => {
   $("#editor").classList.add("hidden");
   $("#setup").classList.remove("hidden");
 });
+
+video().addEventListener("loadedmetadata", () => renderTimeline());
 
 // ---------- speakers panel ----------
 
@@ -283,6 +311,7 @@ $("#spSave").addEventListener("click", () => {
   markDirty();
   renderSpeakers();
   renderWords();
+  renderTimeline();
   closeSpeakerModal();
 });
 
@@ -294,6 +323,7 @@ $("#spDelete").addEventListener("click", () => {
   markDirty();
   renderSpeakers();
   renderWords();
+  renderTimeline();
   closeSpeakerModal();
 });
 
@@ -306,132 +336,132 @@ $("#followToggle").addEventListener("click", () => {
   btn.classList.toggle("unlocked", !state.followVideo);
 });
 
-// ---------- words panel & selection ----------
+// ---------- words panel ----------
 
 function renderWords() {
   const list = $("#wordsList");
+  const savedScroll = list.scrollTop;
   list.innerHTML = "";
-  state.cards.forEach((card, idx) => {
-    const row = document.createElement("div");
-    row.className = "word-row" + (state.selection.has(idx) ? " selected" : "");
-    row.dataset.idx = idx;
+  list.classList.toggle("single-lane", state.laneCount <= 1);
+  state.cards.forEach((card) => list.appendChild(buildRow(card)));
+  list.scrollTop = savedScroll;
+}
 
-    const handle = document.createElement("span");
-    handle.className = "row-handle";
-    handle.textContent = "☰";
-    handle.title = "Click to select — drag for a range, Shift-click to extend, Ctrl-click to add/remove one";
-    handle.addEventListener("mousedown", (e) => onHandleMouseDown(e, idx));
-    handle.addEventListener("mouseenter", () => onHandleMouseEnter(idx));
+function buildRow(card) {
+  const id = card._id;
+  const row = document.createElement("div");
+  row.className = "word-row" + (state.selection.has(id) ? " selected" : "");
+  row.dataset.id = id;
 
-    const seekBtn = document.createElement("button");
-    seekBtn.className = "seek-btn";
-    seekBtn.textContent = "▶";
-    seekBtn.title = "Jump video to this word's start";
-    seekBtn.addEventListener("click", (e) => { e.stopPropagation(); video().currentTime = card.start; });
+  const handle = document.createElement("span");
+  handle.className = "row-handle";
+  handle.textContent = "☰";
+  handle.title = "Click to select — drag for a range, Shift-click to extend, Ctrl-click to add/remove one";
+  handle.addEventListener("mousedown", (e) => onHandleMouseDown(e, id));
+  handle.addEventListener("mouseenter", () => onHandleMouseEnter(id));
 
-    const startInput = document.createElement("input");
-    startInput.type = "number";
-    startInput.step = "0.01";
-    startInput.className = "time-input start-time";
-    startInput.value = card.start.toFixed(3);
-    startInput.title = "Start time (seconds)";
-    startInput.addEventListener("click", (e) => e.stopPropagation());
-    startInput.addEventListener("change", () => {
-      const next = parseFloat(startInput.value);
-      if (isNaN(next) || next >= card.end) {
-        startInput.value = card.start.toFixed(3);
-        return;
-      }
-      const prev = card.start;
-      card.start = next;
-      pushUndo({ type: "timing", idx, field: "start", prev, next });
-      markDirty();
-    });
+  const seekBtn = document.createElement("button");
+  seekBtn.className = "seek-btn";
+  seekBtn.textContent = "▶";
+  seekBtn.title = "Jump video to this word's start";
+  seekBtn.addEventListener("click", (e) => { e.stopPropagation(); video().currentTime = card.start; });
 
-    const sep = document.createElement("span");
-    sep.className = "time-sep";
-    sep.textContent = "–";
-
-    const endInput = document.createElement("input");
-    endInput.type = "number";
-    endInput.step = "0.01";
-    endInput.className = "time-input end-time";
-    endInput.value = card.end.toFixed(3);
-    endInput.title = "End time (seconds)";
-    endInput.addEventListener("click", (e) => e.stopPropagation());
-    endInput.addEventListener("change", () => {
-      const next = parseFloat(endInput.value);
-      if (isNaN(next) || next <= card.start) {
-        endInput.value = card.end.toFixed(3);
-        return;
-      }
-      const prev = card.end;
-      card.end = next;
-      pushUndo({ type: "timing", idx, field: "end", prev, next });
-      markDirty();
-    });
-
-    const text = document.createElement("input");
-    text.className = "text";
-    text.type = "text";
-    text.value = cardEditorText(card);
-    text.title = "*note* = editor note (not shown in the video)   |  = line break";
-    text.addEventListener("click", (e) => e.stopPropagation());
-    text.addEventListener("change", () => {
-      const prev = cardEditorText(card);
-      const next = text.value;
-      if (prev === next) return;
-      applyEditorText(card, next);
-      text.value = cardEditorText(card); // show the canonical form (notes tidied to the end)
-      pushUndo({ type: "text", idx, prev, next: text.value });
-      updateNoteChip(text.closest(".word-row"), card);
-      markDirty();
-    });
-
-    const noteChip = document.createElement("span");
-    noteChip.className = "note-chip hidden";
-
-    const badge = document.createElement("span");
-    badge.className = "speaker-badge" + (card.speaker ? "" : " unassigned");
-    badge.textContent = card.speaker || "—";
-    const sp = card.speaker ? speakerByName(card.speaker) : null;
-    if (sp) { badge.style.background = sp.color; badge.style.color = "#101215"; }
-
-    const emojiBtn = document.createElement("button");
-    emojiBtn.className = "row-icon-btn";
-    emojiBtn.textContent = "😀";
-    emojiBtn.title = "Insert emoji";
-    emojiBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openEmojiPicker(emojiBtn, text);
-    });
-
-    const insertBtn = document.createElement("button");
-    insertBtn.className = "row-icon-btn";
-    insertBtn.textContent = "+";
-    insertBtn.title = "Insert a new blank caption after this one";
-    insertBtn.addEventListener("click", (e) => { e.stopPropagation(); insertCardAfter(idx); });
-
-    const deleteBtn = document.createElement("button");
-    deleteBtn.className = "row-icon-btn danger";
-    deleteBtn.textContent = "✕";
-    deleteBtn.title = "Delete this caption";
-    deleteBtn.addEventListener("click", (e) => { e.stopPropagation(); deleteCard(idx); });
-
-    row.appendChild(handle);
-    row.appendChild(seekBtn);
-    row.appendChild(startInput);
-    row.appendChild(sep);
-    row.appendChild(endInput);
-    row.appendChild(text);
-    row.appendChild(noteChip);
-    row.appendChild(badge);
-    row.appendChild(emojiBtn);
-    row.appendChild(insertBtn);
-    row.appendChild(deleteBtn);
-    list.appendChild(row);
-    updateNoteChip(row, card);
+  const startInput = document.createElement("input");
+  startInput.type = "number";
+  startInput.step = "0.01";
+  startInput.className = "time-input start-time";
+  startInput.value = card.start.toFixed(3);
+  startInput.title = "Start time (seconds)";
+  startInput.addEventListener("click", (e) => e.stopPropagation());
+  startInput.addEventListener("change", () => {
+    const next = parseFloat(startInput.value);
+    if (isNaN(next) || next < 0 || next >= card.end) { startInput.value = card.start.toFixed(3); return; }
+    applyMove([{ card, start: next, end: card.end, lane: laneOf(card) }], "edit");
   });
+
+  const sep = document.createElement("span");
+  sep.className = "time-sep";
+  sep.textContent = "–";
+
+  const endInput = document.createElement("input");
+  endInput.type = "number";
+  endInput.step = "0.01";
+  endInput.className = "time-input end-time";
+  endInput.value = card.end.toFixed(3);
+  endInput.title = "End time (seconds)";
+  endInput.addEventListener("click", (e) => e.stopPropagation());
+  endInput.addEventListener("change", () => {
+    const next = parseFloat(endInput.value);
+    if (isNaN(next) || next <= card.start) { endInput.value = card.end.toFixed(3); return; }
+    applyMove([{ card, start: card.start, end: next, lane: laneOf(card) }], "edit");
+  });
+
+  const text = document.createElement("input");
+  text.className = "text";
+  text.type = "text";
+  text.value = cardEditorText(card);
+  text.title = "*note* = editor note (not shown in the video)   |  = line break";
+  text.addEventListener("click", (e) => e.stopPropagation());
+  text.addEventListener("change", () => {
+    const prev = cardEditorText(card);
+    const next = text.value;
+    if (prev === next) return;
+    applyEditorText(card, next);
+    text.value = cardEditorText(card); // show the canonical form (notes tidied to the end)
+    pushUndo({ type: "text", id, prev, next: text.value });
+    updateNoteChip(row, card);
+    updateBlock(card);
+    markDirty();
+  });
+
+  const noteChip = document.createElement("span");
+  noteChip.className = "note-chip hidden";
+
+  const badge = document.createElement("span");
+  badge.className = "speaker-badge";
+
+  const laneSel = document.createElement("select");
+  laneSel.className = "lane-select";
+  laneSel.title = "Which timeline this caption is on (simultaneous captions)";
+  for (let i = 0; i < state.laneCount; i++) {
+    const o = document.createElement("option");
+    o.value = i;
+    o.textContent = `T${i + 1}`;
+    laneSel.appendChild(o);
+  }
+  laneSel.value = String(laneOf(card));
+  laneSel.addEventListener("change", () => {
+    const lane = parseInt(laneSel.value, 10);
+    laneSel.blur();
+    applyMove([{ card, start: card.start, end: card.end, lane }], "edit");
+  });
+
+  const emojiBtn = document.createElement("button");
+  emojiBtn.className = "row-icon-btn";
+  emojiBtn.textContent = "😀";
+  emojiBtn.title = "Insert emoji";
+  emojiBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    openEmojiPicker(emojiBtn, text);
+  });
+
+  const insertBtn = document.createElement("button");
+  insertBtn.className = "row-icon-btn";
+  insertBtn.textContent = "+";
+  insertBtn.title = "Insert a new blank caption after this one";
+  insertBtn.addEventListener("click", (e) => { e.stopPropagation(); insertCardAfter(id); });
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.className = "row-icon-btn danger";
+  deleteBtn.textContent = "✕";
+  deleteBtn.title = "Delete this caption";
+  deleteBtn.addEventListener("click", (e) => { e.stopPropagation(); deleteCard(id); });
+
+  [handle, seekBtn, startInput, sep, endInput, text, noteChip, badge, laneSel, emojiBtn, insertBtn, deleteBtn]
+    .forEach((el) => row.appendChild(el));
+  updateNoteChip(row, card);
+  updateBadge(row, card);
+  return row;
 }
 
 function updateNoteChip(row, card) {
@@ -442,47 +472,85 @@ function updateNoteChip(row, card) {
   chip.title = card.note || "";
 }
 
+function updateBadge(row, card) {
+  const badge = row.querySelector(".speaker-badge");
+  badge.textContent = card.speaker || "—";
+  badge.className = "speaker-badge" + (card.speaker ? "" : " unassigned");
+  const sp = card.speaker ? speakerByName(card.speaker) : null;
+  if (sp) { badge.style.background = sp.color; badge.style.color = "#101215"; }
+  else { badge.style.background = ""; badge.style.color = ""; }
+}
+
+const rowOf = (id) => $(`.word-row[data-id="${id}"]`);
+
+// Refresh everything shown for one card in the list and the timeline.
+function refreshRow(card, flash = true) {
+  const row = rowOf(card._id);
+  if (row) {
+    row.querySelector(".text").value = cardEditorText(card);
+    updateNoteChip(row, card);
+    updateBadge(row, card);
+    row.querySelector(".start-time").value = card.start.toFixed(3);
+    row.querySelector(".end-time").value = card.end.toFixed(3);
+    row.querySelector(".lane-select").value = String(laneOf(card));
+    if (flash) {
+      row.classList.add("flash");
+      setTimeout(() => row.classList.remove("flash"), 500);
+    }
+  }
+  updateBlock(card);
+}
+
 // ---------- insert / delete captions ----------
 
-function insertCardAt(idx, start, end) {
-  state.cards.splice(idx, 0, { start, end, lines: [""], speaker: null });
-  pushUndo({ type: "insert", idx });
+function addCard(card, focus = true) {
+  card._id = nextId++;
+  state.cards.push(card);
+  sortCards();
+  pushUndo({ type: "insert", id: card._id });
   markDirty();
   clearSelection();
   renderWords();
-  const row = $(`.word-row[data-idx="${idx}"]`);
-  if (row) {
+  renderTimeline();
+  const row = rowOf(card._id);
+  if (row && focus) {
     row.scrollIntoView({ block: "center" });
     row.querySelector(".text").focus();
   }
 }
 
-function insertCardAfter(idx) {
-  const card = state.cards[idx];
-  const next = state.cards[idx + 1];
+// Room before the next caption *on the same timeline*, so a new caption
+// doesn't land on top of a neighbour.
+function nextStartInLane(lane, after) {
+  const nxt = state.cards.find((c) => laneOf(c) === lane && c.start > after);
+  return nxt ? nxt.start : Infinity;
+}
+
+function insertCardAfter(id) {
+  const card = cardById(id);
+  const lane = laneOf(card);
   const start = card.end;
-  let end = start + 0.3;
-  if (next) end = Math.min(end, next.start);
+  let end = Math.min(start + 0.3, nextStartInLane(lane, card.start));
   end = Math.max(end, start + 0.05);
-  insertCardAt(idx + 1, start, end);
+  addCard({ start, end, lines: [""], speaker: null, ...(lane ? { lane } : {}) });
 }
 
 function insertCardAtTime(t) {
-  let idx = state.cards.findIndex((c) => c.start > t);
-  if (idx === -1) idx = state.cards.length;
-  const next = state.cards[idx];
-  let end = t + 0.3;
-  if (next) end = Math.min(end, next.start);
+  const lane = state.activeLane;
+  let end = Math.min(t + 0.3, nextStartInLane(lane, t));
   end = Math.max(end, t + 0.05);
-  insertCardAt(idx, t, end);
+  addCard({ start: t, end, lines: [""], speaker: null, ...(lane ? { lane } : {}) });
 }
 
-function deleteCard(idx) {
+function deleteCard(id) {
+  const idx = idxById(id);
+  if (idx < 0) return;
   const [removed] = state.cards.splice(idx, 1);
-  pushUndo({ type: "delete", idx, card: removed });
+  pushUndo({ type: "delete", card: removed });
   markDirty();
   clearSelection();
   renderWords();
+  renderTimeline();
 }
 
 $("#addCaptionBtn").addEventListener("click", () => insertCardAtTime(video().currentTime));
@@ -494,7 +562,7 @@ const EMOJI_SET = [
   "💀", "🔥", "💯", "👍", "👎", "👏", "🙌", "🤝", "🙏", "💪", "🤡", "🎮",
   "🎉", "🎂", "🍻", "🍺", "💰", "🪓", "⚔️", "🛡️", "🏆", "⭐", "✨", "💥",
   "⚡", "❤️", "💚", "💛", "💙", "💜", "🖤", "🤍", "🚫", "❌", "✅", "❓",
-  "❗", "😅", "🤯", "🫡",
+  "❗", "😅", "🤯", "🫡", "🍑",
 ];
 
 const emojiPickerEl = $("#emojiPicker");
@@ -541,71 +609,25 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// ---------- drag-to-select (via the row-handle grip only, never the text
-// or timestamp, so a selection drag can't turn into a native text
-// selection or collide with editing/seeking) ----------
+// ---------- selection (shared by the list and the timeline) ----------
 
-let dragAnchorIdx = null;
-let dragAdditive = false;
-let dragBaseSelection = null;
-
-function onHandleMouseDown(e, idx) {
-  e.preventDefault(); // stop the drag from starting a native text selection
-  if (e.shiftKey && state.lastSelectedIdx !== null) {
-    dragAnchorIdx = state.lastSelectedIdx;
-    dragAdditive = false;
-    dragBaseSelection = null;
-    applyDragRange(idx);
-  } else if (e.ctrlKey || e.metaKey) {
-    if (state.selection.has(idx)) state.selection.delete(idx);
-    else state.selection.add(idx);
-    state.lastSelectedIdx = idx;
-    dragAnchorIdx = idx;
-    dragAdditive = true;
-    dragBaseSelection = new Set(state.selection);
-    applySelectionClasses();
-    renderSelectionStatus();
-  } else {
-    dragAnchorIdx = idx;
-    dragAdditive = false;
-    dragBaseSelection = null;
-    state.selection = new Set([idx]);
-    state.lastSelectedIdx = idx;
-    applySelectionClasses();
-    renderSelectionStatus();
-  }
-}
-
-function onHandleMouseEnter(idx) {
-  if (dragAnchorIdx === null) return; // not mid-drag
-  applyDragRange(idx);
-}
-
-function applyDragRange(idx) {
-  const [lo, hi] = dragAnchorIdx <= idx ? [dragAnchorIdx, idx] : [idx, dragAnchorIdx];
-  state.selection = dragAdditive ? new Set(dragBaseSelection) : new Set();
-  for (let i = lo; i <= hi; i++) state.selection.add(i);
-  state.lastSelectedIdx = idx;
+function setSelection(ids, lastId = null) {
+  state.selection = new Set(ids);
+  state.lastSelectedId = lastId;
   applySelectionClasses();
   renderSelectionStatus();
 }
 
-document.addEventListener("mouseup", () => {
-  dragAnchorIdx = null;
-  dragBaseSelection = null;
-});
-
 function applySelectionClasses() {
-  document.querySelectorAll(".word-row").forEach((row) => {
-    const idx = parseInt(row.dataset.idx, 10);
-    row.classList.toggle("selected", state.selection.has(idx));
+  document.querySelectorAll(".word-row, .tl-block").forEach((el) => {
+    el.classList.toggle("selected", state.selection.has(parseInt(el.dataset.id, 10)));
   });
 }
 
 function renderSelectionStatus() {
   const el = $("#selectionStatus");
   if (state.selection.size > 1) {
-    el.textContent = `${state.selection.size} words selected — press a speaker key to tag all of them, or Esc to clear`;
+    el.textContent = `${state.selection.size} captions selected — a speaker key tags them all, ←/→ bump their timing, drag any of them on the timeline, Esc to clear`;
     el.classList.remove("hidden");
   } else {
     el.classList.add("hidden");
@@ -613,28 +635,411 @@ function renderSelectionStatus() {
 }
 
 function clearSelection() {
-  state.selection = new Set();
-  state.lastSelectedIdx = null;
-  applySelectionClasses();
-  renderSelectionStatus();
+  setSelection([], null);
 }
 
-function refreshRow(idx) {
-  const row = $(`.word-row[data-idx="${idx}"]`);
-  if (!row) return;
-  const card = state.cards[idx];
-  row.querySelector(".text").value = cardEditorText(card);
-  updateNoteChip(row, card);
-  row.querySelector(".start-time").value = card.start.toFixed(3);
-  row.querySelector(".end-time").value = card.end.toFixed(3);
-  const badge = row.querySelector(".speaker-badge");
-  badge.textContent = card.speaker || "—";
-  badge.className = "speaker-badge" + (card.speaker ? "" : " unassigned");
+// ---------- list drag-to-select (via the row-handle grip only, never the
+// text or times, so a selection drag can't turn into a native text
+// selection or collide with editing/seeking) ----------
+
+let dragAnchorPos = null; // position in state.cards (sorted order)
+let dragAdditive = false;
+let dragBaseSelection = null;
+
+function onHandleMouseDown(e, id) {
+  e.preventDefault(); // stop the drag from starting a native text selection
+  const pos = idxById(id);
+  const lastPos = state.lastSelectedId === null ? -1 : idxById(state.lastSelectedId);
+  if (e.shiftKey && lastPos >= 0) {
+    dragAnchorPos = lastPos;
+    dragAdditive = false;
+    dragBaseSelection = null;
+    applyDragRange(pos);
+  } else if (e.ctrlKey || e.metaKey) {
+    const next = new Set(state.selection);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    dragAnchorPos = pos;
+    dragAdditive = true;
+    dragBaseSelection = new Set(next);
+    setSelection(next, id);
+  } else {
+    dragAnchorPos = pos;
+    dragAdditive = false;
+    dragBaseSelection = null;
+    setSelection([id], id);
+  }
+}
+
+function onHandleMouseEnter(id) {
+  if (dragAnchorPos === null) return; // not mid-drag
+  applyDragRange(idxById(id));
+}
+
+function applyDragRange(pos) {
+  const [lo, hi] = dragAnchorPos <= pos ? [dragAnchorPos, pos] : [pos, dragAnchorPos];
+  const next = dragAdditive ? new Set(dragBaseSelection) : new Set();
+  for (let i = lo; i <= hi; i++) next.add(state.cards[i]._id);
+  setSelection(next, state.cards[pos]._id);
+}
+
+document.addEventListener("mouseup", () => {
+  dragAnchorPos = null;
+  dragBaseSelection = null;
+});
+
+// ---------- moving captions (timeline drag, arrow keys, list edits) ----------
+// Every change to a caption's start/end/lane goes through applyMove so it is
+// undoable, keeps the list sorted, and updates the timeline.
+
+// changes: [{card, start, end, lane}]. kind: "edit" | "drag" | "nudge".
+function applyMove(changes, kind) {
+  const prevItems = [];
+  const changed = [];
+  for (const ch of changes) {
+    const c = ch.card;
+    if (c.start === ch.start && c.end === ch.end && laneOf(c) === ch.lane) continue;
+    prevItems.push({ id: c._id, start: c.start, end: c.end, lane: laneOf(c) });
+    c.start = ch.start;
+    c.end = ch.end;
+    if (ch.lane) c.lane = ch.lane; else delete c.lane;
+    changed.push(c);
+  }
+  if (!changed.length) return;
+
+  const last = state.undoStack[state.undoStack.length - 1];
+  const key = prevItems.map((i) => i.id).join(",");
+  if (kind === "nudge" && last && last.type === "move" && last.kind === "nudge" &&
+      last.key === key && Date.now() - last.t < 900) {
+    last.t = Date.now(); // holding an arrow key is one undo step, not thirty
+  } else {
+    pushUndo({ type: "move", kind, key, t: Date.now(), items: prevItems });
+  }
+  markDirty();
+  afterTimingChange(changed);
+}
+
+function afterTimingChange(changed) {
+  const before = orderKey();
+  sortCards();
+  if (before !== orderKey()) renderWords();
+  else changed.forEach((c) => refreshRow(c, false));
+  renderTimeline();
+}
+
+// Bump the selected captions by dt seconds and/or dl lanes. Returns whether
+// anything was selected.
+function nudgeSelection(dt, dl) {
+  const cards = [...state.selection].map(cardById).filter(Boolean);
+  if (!cards.length) return false;
+  const minStart = Math.min(...cards.map((c) => c.start));
+  const t = Math.max(dt, -minStart);
+  const minLane = Math.min(...cards.map(laneOf));
+  const maxLane = Math.max(...cards.map(laneOf));
+  const l = clamp(dl, -minLane, state.laneCount - 1 - maxLane);
+  applyMove(cards.map((c) => ({
+    card: c, start: c.start + t, end: c.end + t, lane: laneOf(c) + l,
+  })), "nudge");
+  return true;
+}
+
+// ---------- timelines (lanes) ----------
+
+const tlScroll = () => $("#tlScroll");
+const tlContent = () => $("#tlContent");
+
+function timelineSeconds() {
+  const d = video().duration;
+  const maxEnd = state.cards.reduce((m, c) => Math.max(m, c.end), 0);
+  return Math.max(isFinite(d) ? d : 0, maxEnd) + 1;
+}
+
+function renderTimeline() {
+  const scroll = tlScroll();
+  const sl = scroll.scrollLeft, st = scroll.scrollTop;
+  const content = tlContent();
+  content.innerHTML = "";
+  const width = Math.ceil(timelineSeconds() * state.pps);
+  content.style.width = (LABEL_W + width) + "px";
+
+  // ruler
+  const rulerRow = document.createElement("div");
+  rulerRow.className = "tl-row tl-ruler-row";
+  const corner = document.createElement("div");
+  corner.className = "tl-label tl-corner";
+  const ruler = document.createElement("div");
+  ruler.className = "tl-ruler";
+  ruler.style.width = width + "px";
+  const step = state.pps >= 60 ? 1 : state.pps >= 25 ? 5 : 10;
+  for (let s = 0; s * state.pps <= width; s += step) {
+    const tick = document.createElement("div");
+    tick.className = "tl-tick";
+    tick.style.left = s * state.pps + "px";
+    tick.textContent = fmtTime(s);
+    ruler.appendChild(tick);
+  }
+  ruler.addEventListener("mousedown", (e) => startScrub(e, ruler));
+  rulerRow.append(corner, ruler);
+  content.appendChild(rulerRow);
+
+  // lanes
+  for (let lane = 0; lane < state.laneCount; lane++) {
+    const row = document.createElement("div");
+    row.className = "tl-row";
+    const label = document.createElement("div");
+    label.className = "tl-label" + (lane === state.activeLane ? " active" : "");
+    label.textContent = lane === 0 ? "Timeline 1" : `Timeline ${lane + 1}`;
+    label.title = "Click to make this the timeline “+ Add caption” uses";
+    label.addEventListener("click", () => { state.activeLane = lane; renderTimeline(); });
+    if (lane > 0 && lane === state.laneCount - 1) {
+      const rm = document.createElement("button");
+      rm.className = "tl-lane-remove";
+      rm.textContent = "✕";
+      rm.title = "Remove this timeline";
+      rm.addEventListener("click", (e) => { e.stopPropagation(); removeLastLane(); });
+      label.appendChild(rm);
+    }
+    const track = document.createElement("div");
+    track.className = "tl-lane-track";
+    track.dataset.lane = lane;
+    track.style.width = width + "px";
+    track.addEventListener("mousedown", (e) => {
+      if (e.target !== track) return;
+      state.activeLane = lane;
+      clearSelection();
+      startScrub(e, track);
+      document.querySelectorAll(".tl-label").forEach((l, i) => l.classList.toggle("active", i - 1 === lane));
+    });
+    state.cards.forEach((card) => { if (Math.min(laneOf(card), state.laneCount - 1) === lane) track.appendChild(makeBlock(card)); });
+    row.append(label, track);
+    content.appendChild(row);
+  }
+
+  const ph = document.createElement("div");
+  ph.id = "tlPlayhead";
+  ph.className = "tl-playhead";
+  content.appendChild(ph);
+  scroll.scrollLeft = sl;
+  scroll.scrollTop = st;
+  placePlayhead();
+  renderOverlayLanes();
+}
+
+function blockColors(card) {
   const sp = card.speaker ? speakerByName(card.speaker) : null;
-  if (sp) { badge.style.background = sp.color; badge.style.color = "#101215"; }
-  else { badge.style.background = ""; badge.style.color = ""; }
-  row.classList.add("flash");
-  setTimeout(() => row.classList.remove("flash"), 500);
+  return sp ? { bg: sp.color, fg: "#101215" } : { bg: "#4b5468", fg: "#f1f3f7" };
+}
+
+function makeBlock(card) {
+  const b = document.createElement("div");
+  b.className = "tl-block" + (state.selection.has(card._id) ? " selected" : "");
+  b.dataset.id = card._id;
+  const hl = document.createElement("i");
+  hl.className = "tl-h tl-hl";
+  const hr = document.createElement("i");
+  hr.className = "tl-h tl-hr";
+  const label = document.createElement("span");
+  label.className = "tl-text";
+  b.append(hl, label, hr);
+  b.addEventListener("mousedown", (e) => onBlockMouseDown(e, card._id));
+  positionBlock(b, card);
+  return b;
+}
+
+function positionBlock(b, card) {
+  const { bg, fg } = blockColors(card);
+  b.style.left = card.start * state.pps + "px";
+  b.style.width = Math.max(6, (card.end - card.start) * state.pps) + "px";
+  b.style.background = bg;
+  b.style.color = fg;
+  b.title = `${card.lines.join(" / ")}\n${card.start.toFixed(2)}s – ${card.end.toFixed(2)}s` +
+    (card.note ? `\n📝 ${card.note}` : "");
+  b.querySelector(".tl-text").textContent = card.lines.join(" / ") + (card.note ? " 📝" : "");
+}
+
+function updateBlock(card) {
+  const b = $(`.tl-block[data-id="${card._id}"]`);
+  if (b) positionBlock(b, card);
+}
+
+function laneAtY(clientY) {
+  const tracks = [...document.querySelectorAll(".tl-lane-track")];
+  for (let i = 0; i < tracks.length; i++) {
+    if (clientY < tracks[i].getBoundingClientRect().bottom) return i;
+  }
+  return Math.max(0, tracks.length - 1);
+}
+
+function placePlayhead() {
+  const ph = $("#tlPlayhead");
+  if (ph) ph.style.left = (LABEL_W + video().currentTime * state.pps) + "px";
+}
+
+// -- ruler / empty-lane scrubbing --
+
+let scrubbing = null;
+function startScrub(e, el) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  scrubbing = el;
+  scrubTo(e.clientX);
+}
+function scrubTo(clientX) {
+  if (!scrubbing) return;
+  const rect = scrubbing.getBoundingClientRect();
+  const dur = video().duration;
+  const t = clamp((clientX - rect.left) / state.pps, 0, isFinite(dur) ? dur : Infinity);
+  video().currentTime = t;
+  placePlayhead();
+}
+
+// -- dragging captions on the timeline --
+
+let tlDrag = null;
+const DRAG_THRESHOLD_PX = 3;
+
+function onBlockMouseDown(e, id) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const card = cardById(id);
+  const edge = e.target.classList.contains("tl-hl") ? "l" : e.target.classList.contains("tl-hr") ? "r" : null;
+
+  let collapseOnClick = false;
+  if (e.ctrlKey || e.metaKey) {
+    const next = new Set(state.selection);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setSelection(next, id);
+  } else if (e.shiftKey && state.lastSelectedId !== null && idxById(state.lastSelectedId) >= 0) {
+    const [lo, hi] = [idxById(state.lastSelectedId), idxById(id)].sort((a, b) => a - b);
+    setSelection(state.cards.slice(lo, hi + 1).map((c) => c._id), id);
+  } else if (!state.selection.has(id)) {
+    setSelection([id], id);
+  } else {
+    collapseOnClick = state.selection.size > 1 && !edge; // click (no drag) on a group member picks just it
+    state.lastSelectedId = id;
+  }
+  state.activeLane = laneOf(card);
+
+  const movers = edge ? [card] : [...state.selection].map(cardById).filter(Boolean);
+  tlDrag = {
+    id, edge, collapseOnClick, moved: false,
+    startX: e.clientX, grabLane: laneOf(card),
+    orig: new Map(movers.map((c) => [c._id, { start: c.start, end: c.end, lane: laneOf(c) }])),
+  };
+}
+
+document.addEventListener("mousemove", (e) => {
+  if (scrubbing) { scrubTo(e.clientX); return; }
+  if (!tlDrag) return;
+  const dx = e.clientX - tlDrag.startX;
+  if (!tlDrag.moved && Math.abs(dx) < DRAG_THRESHOLD_PX && laneAtY(e.clientY) === tlDrag.grabLane) return;
+  tlDrag.moved = true;
+
+  let dt = dx / state.pps;
+  if (!e.altKey) dt = Math.round(dt * FPS) / FPS; // snap to frames; Alt = free
+  const ids = [...tlDrag.orig.keys()];
+  const origs = [...tlDrag.orig.values()];
+
+  if (tlDrag.edge) {
+    const c = cardById(ids[0]), o = origs[0];
+    if (tlDrag.edge === "l") c.start = clamp(o.start + dt, 0, o.end - 0.05);
+    else c.end = Math.max(o.start + 0.05, o.end + dt);
+    updateBlock(c);
+    const row = rowOf(c._id);
+    if (row) {
+      row.querySelector(".start-time").value = c.start.toFixed(3);
+      row.querySelector(".end-time").value = c.end.toFixed(3);
+    }
+    return;
+  }
+
+  const t = Math.max(dt, -Math.min(...origs.map((o) => o.start)));
+  const dl = clamp(laneAtY(e.clientY) - tlDrag.grabLane,
+    -Math.min(...origs.map((o) => o.lane)),
+    state.laneCount - 1 - Math.max(...origs.map((o) => o.lane)));
+  ids.forEach((id) => {
+    const c = cardById(id), o = tlDrag.orig.get(id);
+    c.start = o.start + t;
+    c.end = o.end + t;
+    const lane = o.lane + dl;
+    if (lane) c.lane = lane; else delete c.lane;
+    let b = $(`.tl-block[data-id="${id}"]`);
+    positionBlock(b, c);
+    const track = document.querySelector(`.tl-lane-track[data-lane="${lane}"]`);
+    if (track && b.parentElement !== track) track.appendChild(b);
+    const row = rowOf(id);
+    if (row) {
+      row.querySelector(".start-time").value = c.start.toFixed(3);
+      row.querySelector(".end-time").value = c.end.toFixed(3);
+    }
+  });
+});
+
+document.addEventListener("mouseup", () => {
+  scrubbing = null;
+  if (!tlDrag) return;
+  const d = tlDrag;
+  tlDrag = null;
+  if (!d.moved) {
+    if (d.collapseOnClick) setSelection([d.id], d.id);
+    const c = cardById(d.id);
+    if (c) { video().currentTime = c.start; placePlayhead(); } // a plain click also cues the video there
+    return;
+  }
+  // Commit the drag as a single undo step, from the positions before it began.
+  const changed = [];
+  const prevItems = [];
+  d.orig.forEach((o, id) => {
+    const c = cardById(id);
+    if (c.start !== o.start || c.end !== o.end || laneOf(c) !== o.lane) {
+      prevItems.push({ id, start: o.start, end: o.end, lane: o.lane });
+      changed.push(c);
+    }
+  });
+  if (!changed.length) return;
+  pushUndo({ type: "move", kind: "drag", key: "", t: 0, items: prevItems });
+  markDirty();
+  afterTimingChange(changed);
+});
+
+// -- zoom / lanes --
+
+function setZoom(pps) {
+  state.pps = clamp(pps, 15, 600);
+  renderTimeline();
+}
+$("#tlZoomIn").addEventListener("click", () => setZoom(state.pps * 1.35));
+$("#tlZoomOut").addEventListener("click", () => setZoom(state.pps / 1.35));
+$("#tlScroll").addEventListener("wheel", (e) => {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  setZoom(state.pps * (e.deltaY < 0 ? 1.2 : 1 / 1.2));
+}, { passive: false });
+
+$("#addLaneBtn").addEventListener("click", () => {
+  state.laneCount += 1;
+  state.activeLane = state.laneCount - 1;
+  pushUndo({ type: "lane-add" });
+  renderWords();
+  renderTimeline();
+});
+
+function removeLastLane() {
+  if (state.laneCount <= 1) return;
+  const lane = state.laneCount - 1;
+  const inLane = state.cards.filter((c) => laneOf(c) === lane);
+  if (inLane.length && !confirm(
+    `Timeline ${lane + 1} has ${inLane.length} caption${inLane.length > 1 ? "s" : ""}. ` +
+    `Move ${inLane.length > 1 ? "them" : "it"} to Timeline ${lane} and remove this timeline?`)) return;
+  const items = inLane.map((c) => ({ id: c._id, lane }));
+  inLane.forEach((c) => { if (lane - 1) c.lane = lane - 1; else delete c.lane; });
+  state.laneCount -= 1;
+  state.activeLane = Math.min(state.activeLane, state.laneCount - 1);
+  pushUndo({ type: "lane-remove", items });
+  if (inLane.length) markDirty();
+  sortCards();
+  renderWords();
+  renderTimeline();
 }
 
 // ---------- undo ----------
@@ -644,30 +1049,56 @@ function pushUndo(action) {
 }
 
 function undoLast() {
-  const action = state.undoStack.pop();
-  if (!action) return;
-  if (action.type === "speaker") {
-    state.cards[action.idx].speaker = action.prev;
-    refreshRow(action.idx);
-  } else if (action.type === "text") {
-    applyEditorText(state.cards[action.idx], action.prev);
-    refreshRow(action.idx);
-  } else if (action.type === "speaker-batch") {
-    for (const item of action.items) {
-      state.cards[item.idx].speaker = item.prev;
-      refreshRow(item.idx);
-    }
-  } else if (action.type === "timing") {
-    state.cards[action.idx][action.field] = action.prev;
-    refreshRow(action.idx);
-  } else if (action.type === "insert") {
-    state.cards.splice(action.idx, 1);
+  const a = state.undoStack.pop();
+  if (!a) return;
+  if (a.type === "speaker") {
+    const c = cardById(a.id);
+    if (c) { c.speaker = a.prev; refreshRow(c); }
+  } else if (a.type === "text") {
+    const c = cardById(a.id);
+    if (c) { applyEditorText(c, a.prev); refreshRow(c); }
+  } else if (a.type === "speaker-batch") {
+    a.items.forEach((it) => {
+      const c = cardById(it.id);
+      if (c) { c.speaker = it.prev; refreshRow(c); }
+    });
+  } else if (a.type === "move") {
+    const cs = [];
+    a.items.forEach((it) => {
+      const c = cardById(it.id);
+      if (!c) return;
+      c.start = it.start;
+      c.end = it.end;
+      if (it.lane) c.lane = it.lane; else delete c.lane;
+      cs.push(c);
+    });
+    afterTimingChange(cs);
+  } else if (a.type === "insert") {
+    const i = idxById(a.id);
+    if (i >= 0) state.cards.splice(i, 1);
     clearSelection();
     renderWords();
-  } else if (action.type === "delete") {
-    state.cards.splice(action.idx, 0, action.card);
+    renderTimeline();
+  } else if (a.type === "delete") {
+    state.cards.push(a.card);
+    sortCards();
     clearSelection();
     renderWords();
+    renderTimeline();
+  } else if (a.type === "lane-add") {
+    state.laneCount = Math.max(1, state.laneCount - 1);
+    state.activeLane = Math.min(state.activeLane, state.laneCount - 1);
+    renderWords();
+    renderTimeline();
+  } else if (a.type === "lane-remove") {
+    state.laneCount += 1;
+    a.items.forEach((it) => {
+      const c = cardById(it.id);
+      if (c) { if (it.lane) c.lane = it.lane; else delete c.lane; }
+    });
+    sortCards();
+    renderWords();
+    renderTimeline();
   }
   markDirty(state.undoStack.length > 0 || state.dirty);
 }
@@ -676,11 +1107,23 @@ function undoLast() {
 
 const REACTION_LEEWAY = 0.35; // seconds of tolerance for a slightly-late keypress
 
+// The caption a "tag the current word" keypress means: the most recently
+// started one (any timeline). Ties go to the lowest timeline.
 function currentCardIndex(t) {
   let best = -1;
   for (let i = 0; i < state.cards.length; i++) {
-    if (state.cards[i].start <= t + REACTION_LEEWAY) best = i;
-    else break;
+    const c = state.cards[i];
+    if (c.start > t + REACTION_LEEWAY) break;
+    if (best < 0 || c.start > state.cards[best].start) best = i;
+  }
+  return best;
+}
+
+function currentCardInLane(t, lane) {
+  let best = null;
+  for (const c of state.cards) {
+    if (c.start > t + REACTION_LEEWAY) break;
+    if (laneOf(c) === lane) best = c;
   }
   return best;
 }
@@ -688,16 +1131,16 @@ function currentCardIndex(t) {
 function assignSpeaker(name) {
   if (state.selection.size > 0) {
     const items = [];
-    for (const idx of state.selection) {
-      const card = state.cards[idx];
-      if (card.speaker === name) continue;
-      items.push({ idx, prev: card.speaker });
+    for (const id of state.selection) {
+      const card = cardById(id);
+      if (!card || card.speaker === name) continue;
+      items.push({ id, prev: card.speaker });
       card.speaker = name;
     }
     if (items.length > 0) {
       pushUndo({ type: "speaker-batch", items, next: name });
       markDirty();
-      items.forEach((item) => refreshRow(item.idx));
+      items.forEach((item) => refreshRow(cardById(item.id)));
     }
     // Tagging always closes out the selection — next hotkey starts fresh
     // instead of silently piling onto whatever was selected before.
@@ -711,11 +1154,11 @@ function assignSpeaker(name) {
   if (card.speaker === name) return;
   const prev = card.speaker;
   card.speaker = name;
-  pushUndo({ type: "speaker", idx, prev, next: name });
+  pushUndo({ type: "speaker", id: card._id, prev, next: name });
   markDirty();
-  refreshRow(idx);
+  refreshRow(card);
   if (state.followVideo) {
-    const row = $(`.word-row[data-idx="${idx}"]`);
+    const row = rowOf(card._id);
     if (row) row.scrollIntoView({ block: "nearest" });
   }
 }
@@ -725,7 +1168,7 @@ function assignSpeaker(name) {
 function isTypingTarget(el) {
   if (!el) return false;
   const tag = el.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
 }
 
 document.addEventListener("keydown", (e) => {
@@ -764,6 +1207,23 @@ document.addEventListener("keydown", (e) => {
     clearSelection();
     return;
   }
+  // Arrow keys bump the selected captions: ←/→ one frame (Shift = 10 frames),
+  // ↑/↓ one timeline up/down.
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    if (state.selection.size) {
+      e.preventDefault();
+      const frames = e.shiftKey ? 10 : 1;
+      nudgeSelection((e.key === "ArrowLeft" ? -frames : frames) / FPS, 0);
+    }
+    return;
+  }
+  if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    if (state.selection.size) {
+      e.preventDefault();
+      nudgeSelection(0, e.key === "ArrowUp" ? -1 : 1);
+    }
+    return;
+  }
   const key = e.key.toLowerCase();
   const sp = state.speakers.find((s) => s.key === key);
   if (sp) {
@@ -772,20 +1232,34 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-function updateOverlay() {
-  const idx = currentCardIndex(video().currentTime);
+// The live preview mirrors the renderer: timeline 1 is the big main caption,
+// further timelines stack smaller underneath it.
+function renderOverlayLanes() {
   const overlay = $("#overlay");
-  if (idx < 0 || !state.cards[idx] || video().currentTime > state.cards[idx].end + 0.4) {
-    overlay.textContent = "";
-    return;
+  overlay.innerHTML = "";
+  for (let i = 0; i < state.laneCount; i++) {
+    const d = document.createElement("div");
+    d.className = "ov-line" + (i > 0 ? " ov-sub" : "");
+    d.dataset.lane = i;
+    overlay.appendChild(d);
   }
-  const card = state.cards[idx];
-  overlay.textContent = card.lines.join("\n").toUpperCase();
-  const sp = card.speaker ? speakerByName(card.speaker) : null;
-  overlay.style.color = sp ? sp.color : "#ffffff";
+}
 
+function updateOverlay() {
+  const t = video().currentTime;
+  document.querySelectorAll("#overlay .ov-line").forEach((d) => {
+    const lane = parseInt(d.dataset.lane, 10);
+    const card = currentCardInLane(t, lane);
+    if (!card || t > card.end + 0.4) { d.textContent = ""; return; }
+    d.textContent = card.lines.join("\n").toUpperCase();
+    const sp = card.speaker ? speakerByName(card.speaker) : null;
+    d.style.color = sp ? sp.color : "#ffffff";
+  });
+
+  const idx = currentCardIndex(t);
   document.querySelectorAll(".word-row.current").forEach((r) => r.classList.remove("current"));
-  const row = $(`.word-row[data-idx="${idx}"]`);
+  if (idx < 0 || t > state.cards[idx].end + 0.4) return;
+  const row = rowOf(state.cards[idx]._id);
   if (row) {
     row.classList.add("current");
     // Still marked so you can find the live word by eye while browsing,
@@ -794,10 +1268,22 @@ function updateOverlay() {
   }
 }
 
+function followTimeline() {
+  if (!state.followVideo || tlDrag || scrubbing) return;
+  const scroll = tlScroll();
+  const x = video().currentTime * state.pps;
+  const view = scroll.clientWidth - LABEL_W;
+  if (x < scroll.scrollLeft + 10 || x > scroll.scrollLeft + view - 40) {
+    scroll.scrollLeft = Math.max(0, x - view * 0.25);
+  }
+}
+
 function tick() {
   const v = video();
   if (v.duration) {
     updateOverlay();
+    placePlayhead();
+    followTimeline();
     if (!state.dragging) {
       $("#seekBar").value = Math.round((v.currentTime / v.duration) * 1000);
     }
@@ -850,11 +1336,13 @@ $("#saveBtn").addEventListener("click", async () => {
     return;
   }
 
+  sortCards();
   const bakedCards = state.cards.map((c) => {
     // Carry through any field the editor doesn't manage (fx, emphasis_scale,
     // ...) so saving never silently strips data another tool put on a card.
-    const { speaker: _s, fill: _f, note: _n, ...passthrough } = c;
+    const { _id, speaker: _s, fill: _f, note: _n, lane: _l, ...passthrough } = c;
     const out = { ...passthrough, start: c.start, end: c.end, lines: c.lines };
+    if (laneOf(c)) out.lane = laneOf(c);
     if (c.note) out.note = c.note;
     if (c.speaker) {
       out.speaker = c.speaker;
