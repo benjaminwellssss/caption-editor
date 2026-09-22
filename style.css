@@ -23,8 +23,8 @@ h3 { margin: 0; font-size: 14px; text-transform: uppercase; letter-spacing: .04e
 .picked-name { flex: 1; font-size: 13px; color: #6f747d; font-style: italic; }
 .picked-name.chosen { color: #d7dae0; font-style: normal; }
 button {
-  padding: 8px 14px; border-radius: 6px; border: 1px solid #3a3f48;
-  background: #23262c; color: #e8e8ea; cursor: pointer; font-size: 13px;
+  padding: 12px 21px; border-radius: 9px; border: 1px solid #3a3f48;
+  background: #23262c; color: #e8e8ea; cursor: pointer; font-size: 20px;
 }
 button:hover { background: #2b2f37; }
 button.primary { background: #3d7bff; border-color: #3d7bff; color: #fff; font-weight: 600; }
@@ -116,7 +116,7 @@ button.danger:hover { background: #8a2f3c; }
 .word-row .row-handle:hover { color: #9aa0aa; background: #262a31; }
 .word-row.selected .row-handle { color: #7fb2ff; }
 .word-row .seek-btn {
-  flex-shrink: 0; width: 18px; height: 18px; padding: 0; font-size: 9px;
+  flex-shrink: 0; width: 27px; height: 27px; padding: 0; font-size: 14px;
   border: none; background: transparent; color: #767c86; cursor: pointer;
 }
 .word-row .seek-btn:hover { color: #9aa0aa; }
@@ -142,8 +142,8 @@ button.danger:hover { background: #8a2f3c; }
   background: #2a2d33; color: #767c86; font-weight: 400;
 }
 .word-row .row-icon-btn {
-  flex-shrink: 0; width: 22px; height: 22px; padding: 0; font-size: 12px;
-  border: 1px solid #33373f; border-radius: 4px; background: #1e2126;
+  flex-shrink: 0; width: 33px; height: 33px; padding: 0; font-size: 18px;
+  border: 1px solid #33373f; border-radius: 6px; background: #1e2126;
   color: #c8ccd4; cursor: pointer; line-height: 1;
 }
 .word-row .row-icon-btn:hover { background: #262a31; }
@@ -154,7 +154,7 @@ button.danger:hover { background: #8a2f3c; }
 .words-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .words-header h3 { margin-right: auto; }
 .follow-toggle {
-  font-size: 12px; padding: 6px 10px;
+  font-size: 18px; padding: 9px 15px;
 }
 .follow-toggle.unlocked { background: #3d2f0f; border-color: #6b5220; color: #ffcf7a; }
 .follow-toggle.unlocked:hover { background: #4a3a13; }
@@ -162,12 +162,12 @@ button.danger:hover { background: #8a2f3c; }
 .emoji-picker {
   position: fixed; z-index: 60; background: #1c1f25; border: 1px solid #33373f;
   border-radius: 8px; padding: 6px; display: grid; grid-template-columns: repeat(8, 1fr);
-  gap: 2px; width: 272px; max-height: 220px; overflow-y: auto;
+  gap: 3px; width: 408px; max-height: 220px; overflow-y: auto;
   box-shadow: 0 8px 24px rgba(0,0,0,.5);
 }
 .emoji-picker button {
-  font-size: 18px; padding: 4px; border: none; background: transparent;
-  cursor: pointer; border-radius: 4px; line-height: 1.4;
+  font-size: 27px; padding: 6px; border: none; background: transparent;
+  cursor: pointer; border-radius: 6px; line-height: 1.4;
 }
 .emoji-picker button:hover { background: #2b2f37; }
 
@@ -184,7 +184,7 @@ button.danger:hover { background: #8a2f3c; }
   display: flex; justify-content: space-between; align-items: center;
   padding: 12px 16px; border-bottom: 1px solid #2a2d33; font-size: 14px;
 }
-.modal-header button { border: none; background: transparent; font-size: 18px; padding: 0 6px; }
+.modal-header button { border: none; background: transparent; font-size: 27px; padding: 0 9px; }
 
 .speaker-form { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 .speaker-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #9aa0aa; }
