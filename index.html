@@ -37,6 +37,8 @@
     <div id="projectLabel" class="project-label"></div>
     <div class="spacer"></div>
     <span id="dirtyFlag" class="dirty-flag hidden">unsaved changes</span>
+    <button id="undoBtn" title="Undo (Backspace)">↶ Undo</button>
+    <button id="redoBtn" title="Redo (Shift+Backspace)">↷ Redo</button>
     <button id="saveBtn" class="primary">Save</button>
     <button id="backToSetupBtn">Load different files</button>
   </div>
@@ -53,7 +55,7 @@
       </div>
       <div class="hotkey-help">
         <b>Space</b> play/pause &nbsp; <b>&lt;</b> -5s &nbsp; <b>&gt;</b> +5s &nbsp;
-        <b>Enter</b> restart (keeps data) &nbsp; <b>Backspace</b> undo last &nbsp;<br>
+        <b>Enter</b> restart (keeps data) &nbsp; <b>Backspace</b> undo last (last 10) &nbsp; <b>Shift+Backspace</b> redo &nbsp;<br>
 drag the <b>☰</b> handle to select a range, click one to select just that word, <b>Shift</b>-click a handle to extend to it, <b>Ctrl</b>-click to add/remove one &nbsp;
         press a speaker key to tag the current word (or the whole selection, which then clears) &nbsp; <b>Esc</b> clear selection<br>
         each row: <b>▶</b> seek, start/end time (seconds, editable), <b>T1/T2…</b> which timeline it's on, <b>😀</b> insert emoji, <b>+</b> insert a blank caption after it, <b>✕</b> delete it<br>

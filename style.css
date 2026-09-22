@@ -27,6 +27,8 @@ button {
   background: #23262c; color: #e8e8ea; cursor: pointer; font-size: 20px;
 }
 button:hover { background: #2b2f37; }
+button:disabled { opacity: 0.4; cursor: default; }
+button:disabled:hover { background: #23262c; }
 button.primary { background: #3d7bff; border-color: #3d7bff; color: #fff; font-weight: 600; }
 button.primary:hover { background: #5b8fff; }
 button.danger { background: #6a2530; border-color: #6a2530; color: #ffd7db; }

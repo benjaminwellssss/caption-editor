@@ -2,6 +2,7 @@
 
 const FPS = 30;              // frame step for snapping and arrow-key bumps
 const LABEL_W = 96;          // width of the lane-label column in the timeline (matches style.css)
+const MAX_HISTORY = 10;      // how many undo/redo steps are kept
 
 const state = {
   videoHandle: null,
@@ -13,7 +14,8 @@ const state = {
   // {_id, start, end, lines:[text], lane?, speaker: name|null, fill?, note?}
   cards: [],
   speakers: [],    // [{name, key, color}]  color = "#rrggbb"
-  undoStack: [],
+  undoStack: [],   // each entry: {undo(), redo(), ...bookkeeping} — capped at MAX_HISTORY
+  redoStack: [],
   dirty: false,
   editingSpeakerIdx: null, // index into state.speakers, or null for "adding new"
   dragging: false,         // seek bar being dragged
@@ -205,9 +207,11 @@ async function loadProject() {
   state.activeLane = 0;
   state.speakers = speakers;
   state.undoStack = [];
+  state.redoStack = [];
   state.selection = new Set();
   state.lastSelectedId = null;
   markDirty(migrated);
+  updateHistoryButtons();
 
   if (state.videoObjectUrl) URL.revokeObjectURL(state.videoObjectUrl);
   const videoFile = await state.videoHandle.getFile();
@@ -300,13 +304,40 @@ $("#spSave").addEventListener("click", () => {
   if (nameDupe) { errEl.textContent = `A speaker named "${name}" already exists.`; return; }
 
   if (state.editingSpeakerIdx === null) {
-    state.speakers.push({ name, key, color });
+    const newSp = { name, key, color };
+    state.speakers.push(newSp);
+    pushUndo({
+      undo: () => {
+        const i = state.speakers.indexOf(newSp);
+        if (i >= 0) state.speakers.splice(i, 1);
+        renderSpeakers(); renderWords(); renderTimeline();
+      },
+      redo: () => {
+        state.speakers.push(newSp);
+        renderSpeakers(); renderWords(); renderTimeline();
+      },
+    });
   } else {
-    const oldName = state.speakers[state.editingSpeakerIdx].name;
-    state.speakers[state.editingSpeakerIdx] = { name, key, color };
-    if (oldName !== name) {
-      state.cards.forEach((c) => { if (c.speaker === oldName) c.speaker = name; });
-    }
+    const idx = state.editingSpeakerIdx;
+    const oldSp = { ...state.speakers[idx] };
+    const oldName = oldSp.name;
+    const newSp = { name, key, color };
+    const renamed = oldName !== name;
+    const renamedIds = renamed ? state.cards.filter((c) => c.speaker === oldName).map((c) => c._id) : [];
+    state.speakers[idx] = newSp;
+    if (renamed) renamedIds.forEach((id) => { const c = cardById(id); if (c) c.speaker = name; });
+    pushUndo({
+      undo: () => {
+        state.speakers[idx] = oldSp;
+        if (renamed) renamedIds.forEach((id) => { const c = cardById(id); if (c) c.speaker = oldName; });
+        renderSpeakers(); renderWords(); renderTimeline();
+      },
+      redo: () => {
+        state.speakers[idx] = newSp;
+        if (renamed) renamedIds.forEach((id) => { const c = cardById(id); if (c) c.speaker = name; });
+        renderSpeakers(); renderWords(); renderTimeline();
+      },
+    });
   }
   markDirty();
   renderSpeakers();
@@ -317,9 +348,21 @@ $("#spSave").addEventListener("click", () => {
 
 $("#spDelete").addEventListener("click", () => {
   if (state.editingSpeakerIdx === null) return;
-  const sp = state.speakers[state.editingSpeakerIdx];
+  const idx = state.editingSpeakerIdx;
+  const sp = state.speakers[idx];
   if (!confirm(`Delete speaker "${sp.name}"? Words already tagged with them will show as unassigned.`)) return;
-  state.speakers.splice(state.editingSpeakerIdx, 1);
+  state.speakers.splice(idx, 1);
+  pushUndo({
+    undo: () => {
+      state.speakers.splice(idx, 0, sp);
+      renderSpeakers(); renderWords(); renderTimeline();
+    },
+    redo: () => {
+      const i = state.speakers.indexOf(sp);
+      if (i >= 0) state.speakers.splice(i, 1);
+      renderSpeakers(); renderWords(); renderTimeline();
+    },
+  });
   markDirty();
   renderSpeakers();
   renderWords();
@@ -408,7 +451,11 @@ function buildRow(card) {
     if (prev === next) return;
     applyEditorText(card, next);
     text.value = cardEditorText(card); // show the canonical form (notes tidied to the end)
-    pushUndo({ type: "text", id, prev, next: text.value });
+    const canonical = text.value;
+    pushUndo({
+      undo: () => { const c = cardById(id); if (c) { applyEditorText(c, prev); refreshRow(c); } },
+      redo: () => { const c = cardById(id); if (c) { applyEditorText(c, canonical); refreshRow(c); } },
+    });
     updateNoteChip(row, card);
     updateBlock(card);
     markDirty();
@@ -507,7 +554,18 @@ function addCard(card, focus = true) {
   card._id = nextId++;
   state.cards.push(card);
   sortCards();
-  pushUndo({ type: "insert", id: card._id });
+  pushUndo({
+    undo: () => {
+      const i = idxById(card._id);
+      if (i >= 0) state.cards.splice(i, 1);
+      clearSelection(); renderWords(); renderTimeline();
+    },
+    redo: () => {
+      state.cards.push(card);
+      sortCards();
+      clearSelection(); renderWords(); renderTimeline();
+    },
+  });
   markDirty();
   clearSelection();
   renderWords();
@@ -546,7 +604,18 @@ function deleteCard(id) {
   const idx = idxById(id);
   if (idx < 0) return;
   const [removed] = state.cards.splice(idx, 1);
-  pushUndo({ type: "delete", card: removed });
+  pushUndo({
+    undo: () => {
+      state.cards.push(removed);
+      sortCards();
+      clearSelection(); renderWords(); renderTimeline();
+    },
+    redo: () => {
+      const i = idxById(removed._id);
+      if (i >= 0) state.cards.splice(i, 1);
+      clearSelection(); renderWords(); renderTimeline();
+    },
+  });
   markDirty();
   clearSelection();
   renderWords();
@@ -691,14 +760,31 @@ document.addEventListener("mouseup", () => {
 // Every change to a caption's start/end/lane goes through applyMove so it is
 // undoable, keeps the list sorted, and updates the timeline.
 
+// Re-applies a set of {id, start, end, lane} snapshots — shared by every
+// undo/redo closure that reverts or reapplies a timing change.
+function applyItemSnapshots(items) {
+  const cs = [];
+  items.forEach((it) => {
+    const c = cardById(it.id);
+    if (!c) return;
+    c.start = it.start;
+    c.end = it.end;
+    if (it.lane) c.lane = it.lane; else delete c.lane;
+    cs.push(c);
+  });
+  afterTimingChange(cs);
+}
+
 // changes: [{card, start, end, lane}]. kind: "edit" | "drag" | "nudge".
 function applyMove(changes, kind) {
   const prevItems = [];
+  const nextItems = [];
   const changed = [];
   for (const ch of changes) {
     const c = ch.card;
     if (c.start === ch.start && c.end === ch.end && laneOf(c) === ch.lane) continue;
     prevItems.push({ id: c._id, start: c.start, end: c.end, lane: laneOf(c) });
+    nextItems.push({ id: c._id, start: ch.start, end: ch.end, lane: ch.lane });
     c.start = ch.start;
     c.end = ch.end;
     if (ch.lane) c.lane = ch.lane; else delete c.lane;
@@ -706,13 +792,20 @@ function applyMove(changes, kind) {
   }
   if (!changed.length) return;
 
+  const mergeKey = prevItems.map((i) => i.id).join(",");
   const last = state.undoStack[state.undoStack.length - 1];
-  const key = prevItems.map((i) => i.id).join(",");
-  if (kind === "nudge" && last && last.type === "move" && last.kind === "nudge" &&
-      last.key === key && Date.now() - last.t < 900) {
-    last.t = Date.now(); // holding an arrow key is one undo step, not thirty
+  if (kind === "nudge" && last && last._nudgeKey === mergeKey && Date.now() - last._t < 900) {
+    // holding an arrow key is one undo step, not thirty — keep the original
+    // undo (back to before the hold began), just extend what redo replays
+    last._t = Date.now();
+    last.redo = () => applyItemSnapshots(nextItems);
   } else {
-    pushUndo({ type: "move", kind, key, t: Date.now(), items: prevItems });
+    pushUndo({
+      _nudgeKey: kind === "nudge" ? mergeKey : undefined,
+      _t: Date.now(),
+      undo: () => applyItemSnapshots(prevItems),
+      redo: () => applyItemSnapshots(nextItems),
+    });
   }
   markDirty();
   afterTimingChange(changed);
@@ -989,15 +1082,20 @@ document.addEventListener("mouseup", () => {
   // Commit the drag as a single undo step, from the positions before it began.
   const changed = [];
   const prevItems = [];
+  const nextItems = [];
   d.orig.forEach((o, id) => {
     const c = cardById(id);
     if (c.start !== o.start || c.end !== o.end || laneOf(c) !== o.lane) {
       prevItems.push({ id, start: o.start, end: o.end, lane: o.lane });
+      nextItems.push({ id, start: c.start, end: c.end, lane: laneOf(c) });
       changed.push(c);
     }
   });
   if (!changed.length) return;
-  pushUndo({ type: "move", kind: "drag", key: "", t: 0, items: prevItems });
+  pushUndo({
+    undo: () => applyItemSnapshots(prevItems),
+    redo: () => applyItemSnapshots(nextItems),
+  });
   markDirty();
   afterTimingChange(changed);
 });
@@ -1019,7 +1117,18 @@ $("#tlScroll").addEventListener("wheel", (e) => {
 $("#addLaneBtn").addEventListener("click", () => {
   state.laneCount += 1;
   state.activeLane = state.laneCount - 1;
-  pushUndo({ type: "lane-add" });
+  pushUndo({
+    undo: () => {
+      state.laneCount = Math.max(1, state.laneCount - 1);
+      state.activeLane = Math.min(state.activeLane, state.laneCount - 1);
+      renderWords(); renderTimeline();
+    },
+    redo: () => {
+      state.laneCount += 1;
+      state.activeLane = state.laneCount - 1;
+      renderWords(); renderTimeline();
+    },
+  });
   renderWords();
   renderTimeline();
 });
@@ -1035,73 +1144,69 @@ function removeLastLane() {
   inLane.forEach((c) => { if (lane - 1) c.lane = lane - 1; else delete c.lane; });
   state.laneCount -= 1;
   state.activeLane = Math.min(state.activeLane, state.laneCount - 1);
-  pushUndo({ type: "lane-remove", items });
+  pushUndo({
+    undo: () => {
+      state.laneCount += 1;
+      items.forEach((it) => { const c = cardById(it.id); if (c) { if (it.lane) c.lane = it.lane; else delete c.lane; } });
+      sortCards(); renderWords(); renderTimeline();
+    },
+    redo: () => {
+      items.forEach((it) => { const c = cardById(it.id); if (c) { if (lane - 1) c.lane = lane - 1; else delete c.lane; } });
+      state.laneCount = lane;
+      state.activeLane = Math.min(state.activeLane, state.laneCount - 1);
+      sortCards(); renderWords(); renderTimeline();
+    },
+  });
   if (inLane.length) markDirty();
   sortCards();
   renderWords();
   renderTimeline();
 }
 
-// ---------- undo ----------
+// ---------- undo / redo ----------
+// Every mutating action pushes {undo(), redo(), ...} — both closures replay
+// exactly what the original edit did, so there's one code path per action
+// instead of separate forward/reverse interpreters. History is capped at
+// MAX_HISTORY steps each way; making any new edit clears the redo branch,
+// same as every other undo/redo implementation.
 
 function pushUndo(action) {
   state.undoStack.push(action);
+  if (state.undoStack.length > MAX_HISTORY) state.undoStack.shift();
+  state.redoStack = [];
+  updateHistoryButtons();
 }
 
 function undoLast() {
   const a = state.undoStack.pop();
   if (!a) return;
-  if (a.type === "speaker") {
-    const c = cardById(a.id);
-    if (c) { c.speaker = a.prev; refreshRow(c); }
-  } else if (a.type === "text") {
-    const c = cardById(a.id);
-    if (c) { applyEditorText(c, a.prev); refreshRow(c); }
-  } else if (a.type === "speaker-batch") {
-    a.items.forEach((it) => {
-      const c = cardById(it.id);
-      if (c) { c.speaker = it.prev; refreshRow(c); }
-    });
-  } else if (a.type === "move") {
-    const cs = [];
-    a.items.forEach((it) => {
-      const c = cardById(it.id);
-      if (!c) return;
-      c.start = it.start;
-      c.end = it.end;
-      if (it.lane) c.lane = it.lane; else delete c.lane;
-      cs.push(c);
-    });
-    afterTimingChange(cs);
-  } else if (a.type === "insert") {
-    const i = idxById(a.id);
-    if (i >= 0) state.cards.splice(i, 1);
-    clearSelection();
-    renderWords();
-    renderTimeline();
-  } else if (a.type === "delete") {
-    state.cards.push(a.card);
-    sortCards();
-    clearSelection();
-    renderWords();
-    renderTimeline();
-  } else if (a.type === "lane-add") {
-    state.laneCount = Math.max(1, state.laneCount - 1);
-    state.activeLane = Math.min(state.activeLane, state.laneCount - 1);
-    renderWords();
-    renderTimeline();
-  } else if (a.type === "lane-remove") {
-    state.laneCount += 1;
-    a.items.forEach((it) => {
-      const c = cardById(it.id);
-      if (c) { if (it.lane) c.lane = it.lane; else delete c.lane; }
-    });
-    sortCards();
-    renderWords();
-    renderTimeline();
-  }
+  a.undo();
+  state.redoStack.push(a);
+  if (state.redoStack.length > MAX_HISTORY) state.redoStack.shift();
   markDirty(state.undoStack.length > 0 || state.dirty);
+  updateHistoryButtons();
 }
+
+function redoLast() {
+  const a = state.redoStack.pop();
+  if (!a) return;
+  a.redo();
+  state.undoStack.push(a);
+  if (state.undoStack.length > MAX_HISTORY) state.undoStack.shift();
+  markDirty(true);
+  updateHistoryButtons();
+}
+
+function updateHistoryButtons() {
+  const undoBtn = $("#undoBtn");
+  const redoBtn = $("#redoBtn");
+  if (undoBtn) undoBtn.disabled = state.undoStack.length === 0;
+  if (redoBtn) redoBtn.disabled = state.redoStack.length === 0;
+}
+
+$("#undoBtn").addEventListener("click", undoLast);
+$("#redoBtn").addEventListener("click", redoLast);
+updateHistoryButtons();
 
 // ---------- current-word lookup & tagging ----------
 
@@ -1138,7 +1243,10 @@ function assignSpeaker(name) {
       card.speaker = name;
     }
     if (items.length > 0) {
-      pushUndo({ type: "speaker-batch", items, next: name });
+      pushUndo({
+        undo: () => items.forEach((it) => { const c = cardById(it.id); if (c) { c.speaker = it.prev; refreshRow(c); } }),
+        redo: () => items.forEach((it) => { const c = cardById(it.id); if (c) { c.speaker = name; refreshRow(c); } }),
+      });
       markDirty();
       items.forEach((item) => refreshRow(cardById(item.id)));
     }
@@ -1153,8 +1261,12 @@ function assignSpeaker(name) {
   const card = state.cards[idx];
   if (card.speaker === name) return;
   const prev = card.speaker;
+  const id = card._id;
   card.speaker = name;
-  pushUndo({ type: "speaker", id: card._id, prev, next: name });
+  pushUndo({
+    undo: () => { const c = cardById(id); if (c) { c.speaker = prev; refreshRow(c); } },
+    redo: () => { const c = cardById(id); if (c) { c.speaker = name; refreshRow(c); } },
+  });
   markDirty();
   refreshRow(card);
   if (state.followVideo) {
@@ -1199,7 +1311,7 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.key === "Backspace") {
     e.preventDefault();
-    undoLast();
+    if (e.shiftKey) redoLast(); else undoLast();
     return;
   }
   if (e.key === "Escape") {
