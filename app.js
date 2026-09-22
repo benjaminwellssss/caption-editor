@@ -81,11 +81,14 @@ function sortCards() {
 const orderKey = () => state.cards.map((c) => c._id).join(",");
 
 // ---------- editor text syntax ----------
-// What you type in a caption's text box:
-//   *like this*  -> an editor note (instructions for whoever renders the
-//                   video). Saved in card.note, never part of the caption.
-//   |            -> a line break: "HECK|YES" shows HECK above YES.
-// card.lines holds only what is displayed; card.note holds the notes.
+// The caption text box holds only what's displayed on screen:
+//   |  -> a line break: "HECK|YES" shows HECK above YES.
+// Production notes (instructions for whoever renders the video - effects,
+// colors, image overlays, etc.) live in their own dedicated field next to
+// it, saved to card.note. They used to be typed inline as *like this* in
+// the caption box itself; parseEditorText/applyEditorText below still pull
+// a stray *note* out of pasted/legacy text as a migration safety net (see
+// loadProject), but the notes field is now the actual way to write one.
 
 function parseEditorText(raw) {
   const notes = [];
@@ -100,14 +103,25 @@ function parseEditorText(raw) {
 }
 
 function cardEditorText(card) {
-  const shown = card.lines.join("|");
-  return card.note ? `${shown} *${card.note}*` : shown;
+  return card.lines.join("|");
+}
+
+function cardNotesText(card) {
+  return card.note || "";
 }
 
 function applyEditorText(card, raw) {
   const parsed = parseEditorText(raw);
   card.lines = parsed.lines;
+  // Notes are edited in their own field now - only touch card.note here as a
+  // migration safety net when a stray *note* actually shows up in the caption
+  // box (pasted-in legacy text); otherwise leave whatever's already there alone.
   if (parsed.note) card.note = parsed.note;
+}
+
+function applyNotesText(card, raw) {
+  const note = raw.replace(/\s+/g, " ").trim();
+  if (note) card.note = note;
   else delete card.note;
 }
 
@@ -443,23 +457,56 @@ function buildRow(card) {
   text.className = "text";
   text.type = "text";
   text.value = cardEditorText(card);
-  text.title = "*note* = editor note (not shown in the video)   |  = line break";
+  text.title = "What's shown in the video.   |  = line break";
   text.addEventListener("click", (e) => e.stopPropagation());
   text.addEventListener("change", () => {
     const prev = cardEditorText(card);
     const next = text.value;
     if (prev === next) return;
     applyEditorText(card, next);
-    text.value = cardEditorText(card); // show the canonical form (notes tidied to the end)
+    text.value = cardEditorText(card);
     const canonical = text.value;
     pushUndo({
-      undo: () => { const c = cardById(id); if (c) { applyEditorText(c, prev); refreshRow(c); } },
-      redo: () => { const c = cardById(id); if (c) { applyEditorText(c, canonical); refreshRow(c); } },
+      undo: () => {
+        const c = cardById(id);
+        if (c) { c.lines = prev.split("|").map((l) => l.replace(/\s+/g, " ").trim()); refreshRow(c); }
+      },
+      redo: () => {
+        const c = cardById(id);
+        if (c) { c.lines = canonical.split("|").map((l) => l.replace(/\s+/g, " ").trim()); refreshRow(c); }
+      },
     });
     updateNoteChip(row, card);
     updateBlock(card);
     markDirty();
   });
+
+  const notes = document.createElement("input");
+  notes.className = "notes";
+  notes.type = "text";
+  notes.placeholder = "Production notes (effects, colors, image overlays...)";
+  notes.value = cardNotesText(card);
+  notes.title = "Instructions for whoever renders this caption - never shown in the video itself.";
+  notes.addEventListener("click", (e) => e.stopPropagation());
+  notes.addEventListener("change", () => {
+    const prev = cardNotesText(card);
+    const next = notes.value;
+    if (prev === next) return;
+    applyNotesText(card, next);
+    notes.value = cardNotesText(card);
+    const canonical = notes.value;
+    pushUndo({
+      undo: () => { const c = cardById(id); if (c) { applyNotesText(c, prev); refreshRow(c); } },
+      redo: () => { const c = cardById(id); if (c) { applyNotesText(c, canonical); refreshRow(c); } },
+    });
+    updateNoteChip(row, card);
+    updateBlock(card);
+    markDirty();
+  });
+
+  const notesLabel = document.createElement("span");
+  notesLabel.className = "notes-label";
+  notesLabel.textContent = "PROD NOTES";
 
   const noteChip = document.createElement("span");
   noteChip.className = "note-chip hidden";
@@ -504,7 +551,11 @@ function buildRow(card) {
   deleteBtn.title = "Delete this caption";
   deleteBtn.addEventListener("click", (e) => { e.stopPropagation(); deleteCard(id); });
 
-  [handle, seekBtn, startInput, sep, endInput, text, noteChip, badge, laneSel, emojiBtn, insertBtn, deleteBtn]
+  const notesArea = document.createElement("div");
+  notesArea.className = "notes-area";
+  notesArea.append(notesLabel, notes);
+
+  [handle, seekBtn, startInput, sep, endInput, text, notesArea, noteChip, badge, laneSel, emojiBtn, insertBtn, deleteBtn]
     .forEach((el) => row.appendChild(el));
   updateNoteChip(row, card);
   updateBadge(row, card);
@@ -535,6 +586,7 @@ function refreshRow(card, flash = true) {
   const row = rowOf(card._id);
   if (row) {
     row.querySelector(".text").value = cardEditorText(card);
+    row.querySelector(".notes").value = cardNotesText(card);
     updateNoteChip(row, card);
     updateBadge(row, card);
     row.querySelector(".start-time").value = card.start.toFixed(3);

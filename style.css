@@ -136,6 +136,23 @@ button.danger:hover { background: #8a2f3c; }
 }
 .word-row .text:hover { border-color: #33373f; }
 .word-row .text:focus { border-color: #3d7bff; outline: none; background: #14161a; }
+.word-row .notes-area {
+  flex: 1; min-width: 140px; display: flex; align-items: center; gap: 6px;
+  padding: 3px 8px; border-radius: 4px;
+  background: #3d2f0f66; border: 1px solid #6b5220;
+}
+.word-row .notes-label {
+  flex-shrink: 0; font-size: 10px; font-weight: 700; letter-spacing: .05em;
+  color: #ffcf7a; text-transform: uppercase; user-select: none;
+}
+.word-row .notes {
+  flex: 1; min-width: 60px; padding: 3px 4px; border-radius: 4px; background: transparent;
+  border: 1px solid transparent; color: #ffe8bf; font-size: 13px; font-style: italic;
+  user-select: text;
+}
+.word-row .notes::placeholder { color: #a3854f; font-style: italic; }
+.word-row .notes:hover { border-color: #6b5220; }
+.word-row .notes:focus { border-color: #ffcf7a; outline: none; background: #14161a; font-style: normal; }
 .word-row .speaker-badge {
   flex-shrink: 0; padding: 2px 8px; border-radius: 10px; font-size: 11px;
   color: #10121500; min-width: 54px; text-align: center; font-weight: 600;
