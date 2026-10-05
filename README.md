@@ -1,93 +1,141 @@
 # Caption Editor
 
-A standalone, local browser app for correcting captions on a short-form video
-while you watch it: who said each word, the text, the timing, emoji, and
-instructions for the renderer. No install, no dependencies — Python's standard
-library serves three static files; everything else runs in the browser.
+A standalone, local browser app for correcting the captions on a short-form
+video while you watch it. You can fix who said each word, the text, the
+timing and the emoji, and leave instructions for the renderer. There's
+nothing to install: Python's standard library serves three static files, and
+everything else runs in the browser.
 
-**Run it:** double-click the **Caption Editor** desktop shortcut (a tray icon
-starts the server; right-click it for Open / Restart / Quit), or
-`python server.py` and open http://127.0.0.1:8765 in **Chrome or Edge**
-(it needs the File System Access API for native file dialogs).
-`install_shortcut.ps1` recreates the shortcut if the repo ever moves.
+**Companion repo:** [video-editor](https://github.com/benjaminwellssss/video-editor)
+([Gitea mirror](https://git.onebynine.ai/ben/video-editor)) is the pipeline
+on both sides of this editor. It builds the `captions.json` you load here, and
+it renders what you save (`scripts/render_captions.py` + `scripts/caption_fx.py`).
+Its [workflow chart](https://github.com/benjaminwellssss/video-editor#readme)
+shows where this editor fits in the whole stream → shorts process.
 
-**Load:** pick the video, its `captions.json` (a list of timed cards) and,
-optionally, a speakers file. Saving writes straight back to those same files.
+![Caption editor workflow](docs/workflow.svg)
 
-**Caption font:** the dropdown above the speakers list picks which font
-`render_captions.py` uses for this job — Bebas Neue (the house style,
-condensed) or one of four wider/heavier faces chosen for raw legibility at
-small mobile caption sizes: Montserrat Black, Anton, Archivo Black, Poppins
-ExtraBold. It's saved into the speakers file as `{"font": "...", "speakers":
-[...]}` (a speakers file saved by an older version of this editor — a plain
-array — still loads fine; it just has no font opinion, so the renderer
-defaults to Bebas Neue).
+<sub>Also as a PNG: [`docs/workflow.png`](docs/workflow.png). Regenerate with `python docs/make_workflow.py`.</sub>
 
-## Typing in a caption's text box
+## The usual pass
 
-| You type | It means |
-|---|---|
-| `*like this*` | An **editor note** — an instruction for whoever renders the video (for example `*gentle grow and vibrate*`). It is **never shown** in the video. Saved in the card's `note` field, kept out of `lines`. The row shows a 📝 chip; hover it to read the note. |
-| `\|` | A **line break**. `HECK\|YES` puts YES on a second line under HECK. Saved as two entries in `lines`. |
-| any emoji | Type it (Win + `.` opens Windows' emoji picker) or use the 😀 button on the row. |
+1. **Get a clip folder.** The video-editor pipeline writes one per short under
+   `E:\Streaming\Videos\CLIPS\<MM-DD-YYYY_GAME>\<clip>\`, containing
+   `<clip>.mp4` and `captions.json` (one word per card). The captions come
+   either straight from the VOD transcript or, for a hand re-cut, from a
+   transcription of the rendered short itself.
+2. **Launch.** Double-click the **Caption Editor** desktop shortcut. A tray
+   icon starts the server; right-click it for Open / Restart / Quit.
+   Alternatively, run `python server.py` and open http://127.0.0.1:8765 in
+   **Chrome or Edge**; it needs the File System Access API for native file
+   dialogs. `install_shortcut.ps1` recreates the shortcut if the repo moves.
+3. **Load** the video, its `captions.json` and, optionally, a speakers file
+   (speaker names, keys and colors, plus the caption font).
+4. **Fix whatever needs it**, in any order (see the how-tos below).
+5. **Save.** This writes straight back to the same files you loaded.
+6. **Render.** Ask Claude (in the video-editor repo) to render the captions.
+   Your saved cards are drawn **exactly as written**, with no second-guessing.
+   Notes become effects, image links are downloaded, and the overlay is
+   composited into `<clip>_captioned.mp4` next to the clip.
+7. **Proof** the captioned video. If anything is off, reload, fix, save and
+   ask for a re-render.
 
-A lone `*` with no closing `*` would show up in the video, so Save warns you.
-A note is tidied to the end of the text after you commit it, and files that
-older versions of the editor saved with `*note*` typed straight into the
-caption are converted on load.
+## How-tos
 
-**What the renderer does with notes** lives in the video-editor pipeline
-(`scripts/caption_fx.py`, used by `scripts/render_captions.py`): grow, zoom,
-shake and vibrate, scaled by words like *gentle*, *very*, *extremely*,
-*violent*. It prints what it understood for every note, or `NOT UNDERSTOOD`
-for one it can't do, so nothing is silently ignored. Effects apply to the card
-the note is on, and only to the captions — not the video.
+### Fix a word, split a line, add an emoji
+Click into the row's text box and type. A `|` makes a **line break**:
+`HECK|YES` puts YES on a second line under HECK, and saves as two entries in
+`lines`. To add an emoji, use the row's 😀 button, or **Win + .** for
+Windows' picker. Use **+** on a row to insert a blank caption after it, **✕**
+to delete it, or **+ Add caption** in the header to insert one at the
+playhead.
 
-## Timelines (simultaneous captions)
+### Tag who's talking
+Press a **speaker key** to tag the current word, or a whole selection at
+once; the selection then clears. The default keys are B Ben, J Jared, N Noah,
+A Brien, M Marlee, K Kat, T Tony and H Mitch. Each speaker's color becomes
+the caption fill. Edit or add speakers (name, key, color) in the speakers
+panel; recoloring a speaker recolors all of their words on the next save.
 
-The **Timelines** panel above the caption list shows every caption as a block
-on a time ruler, with a red playhead. It starts with one timeline;
-**🕒+ Timeline** adds another lane, so captions can overlap in time — put a
-second (third…) speaker on their own timeline and they show at the same moment.
-In the video, **Timeline 1 is the big main caption** and each further timeline
-stacks **smaller underneath** it (that's what the renderer draws, and what the
-live preview shows). Each caption is colored by its speaker.
+To select several words, drag the ☰ handle, or click it and Shift-click
+another row to extend, or Ctrl-click to add or remove one.
 
-- **Slide:** drag a block left/right (it snaps to frames; hold **Alt** for free
-  movement). Drag it up/down to move it to another timeline. With several
-  captions selected, dragging any one moves them all together.
-- **Resize:** drag a block's left or right edge.
-- **Bump with the keyboard:** select caption(s) (click a block, or use the ☰
-  handle in the list), then **←/→** moves them one frame (**Shift** = ten
-  frames) and **↑/↓** moves them up/down a timeline. Holding a key is a single
+### Fix timing
+- **On the timeline:** drag a block to slide it (it snaps to frames; hold
+  **Alt** for free movement), or drag its left or right edge to resize it.
+- **With the keyboard:** select caption(s), then **←/→** moves them one
+  frame and **Shift** moves ten frames. Holding a key counts as a single
   undo step.
-- **Scrub:** click or drag on the ruler (or an empty part of a lane) to move the
-  video there; a plain click on a block cues the video to its start.
+- **Exactly:** type the start/end seconds into the row.
+
+### Show two people talking at once
+**🕒+ Timeline** adds a lane. Move the second speaker's cards onto it by
+dragging a block down, using **↑/↓**, or picking from the row's **T1/T2…**
+menu. **Timeline 1 is the big main caption**; each further timeline is drawn
+smaller, stacked underneath. The live preview shows the same thing.
+
+### Add an effect, a color, or an image
+Write it in plain English in the row's amber **PROD NOTES** field. Notes are
+**never shown** in the video. The renderer understands:
+
+| Write | Get |
+|---|---|
+| `grow`, `bigger`, `swell` | the caption scales up slowly across the card |
+| `zoom`, `punch`, `pop`, `slam` | a fast punch-in |
+| `shake`, `rumble` / `vibrate`, `jitter` | position jitter (shake is bigger and also rocks) |
+| `dance`, `bounce`, `wiggle` | a smooth bob |
+| `glow`, `shine`, `holy`, `neon` | a radiant flash behind the text |
+| `red`, `green`, `blue`, `yellow`, `orange`, `purple`, `pink`, `white`, `black`, `cyan` | overrides that card's text color |
+| `gentle` / `very` / `extremely` / `violent` / `max` | intensity: ×0.5 / ×1.3 / ×1.5 / ×2 / ×3 |
+| `progressively more …` | ramps the effect up across this and the following cards |
+| an image or GIF link | shows it for that card's duration. Position words: `top left`, `dead center`, `bottom right`, …, or `above`/`below` the caption. `until the end` keeps it up to the end of the video. |
+| `make all instances of "X" shake` / `every time X is said …` | applies to every card with that word |
+| `near the bottom`, `under my face` … `centered again` | moves the caption text itself from this card onward (for full-facecam stretches) |
+
+A card with **no text but a note** is allowed. It drives an image or effect
+with nothing drawn on screen. The renderer reports anything it can't
+understand as `NOT UNDERSTOOD` instead of silently dropping it, so a one-off
+instruction ("photo zooms 500×, vibrating and turning red") gets handled by
+hand.
+
+### Pick the caption font
+The **Caption font** dropdown under the speakers list sets the font for the
+whole job. Bebas Neue is the condensed house style. The other four are
+wider, heavier faces picked for legibility at small mobile sizes: Montserrat
+Black, Anton, Archivo Black and Poppins ExtraBold. The choice is saved in
+the speakers file as `{"font": "...", "speakers": [...]}`. A speakers file
+from an older version (a plain array) still loads, and renders in Bebas
+Neue.
+
+## Timeline panel reference
+
+The **Timelines** panel above the caption list shows every caption as a
+block on a time ruler, colored by speaker, with a red playhead.
+
+- **Scrub:** click or drag on the ruler, or on an empty part of a lane. A
+  plain click on a block cues the video to its start.
 - **Zoom:** the −/+ buttons, or **Ctrl**+mouse wheel.
-- **Which timeline "+ Add caption" uses:** click a timeline's label (it turns
-  blue). The **T1/T2…** menu on each list row also moves a caption between
-  timelines. The **✕** on the last timeline's label removes it (its captions
-  move up one).
+- **Choosing the timeline "+ Add caption" uses:** click a timeline's label
+  (it turns blue).
+- **Removing a timeline:** the **✕** on the last timeline's label removes it,
+  and its captions move up one.
+- **Moving several captions:** with several selected, dragging any one of
+  them moves them all.
 
 ## Controls
 
-- **Space** play/pause · **<** / **>** back / forward 5 s · **Enter** restart
-  (keeps all your edits) · **Backspace** undo the last action (when you're not
-  typing in a box) · **Esc** clear the selection.
-- **Speaker keys** (default: B Ben, J Jared, N Noah, A Brien, M Marlee,
-  K Kat, T Tony, H Mitch — editable, with their colors) tag the current word,
-  or the whole selection at once, and then clear the selection.
-- **Selecting several words:** drag the ☰ handle, or click it and Shift-click
-  another to extend, or Ctrl-click to add/remove one.
-- **Each row:** ▶ seek there · editable start/end (seconds) · 😀 emoji ·
-  **+** insert a blank caption after it · **✕** delete it. **+ Add caption**
-  in the header inserts one at the playhead.
-- **🔒 Following video / 🔓 Free scroll** toggles whether the list follows the
-  playing word or stays where you scrolled it.
+**Space** play/pause · **<** / **>** back / forward 5 s · **Enter** restart
+(keeps your edits) · **Backspace** undo (when not typing in a box) ·
+**Shift+Backspace** redo · **Esc** clear the selection.
+
+**🔒 Following video / 🔓 Free scroll** toggles whether the list follows the
+playing word.
+
+Undo and redo keep the last 10 steps.
 
 ## File format
 
-`captions.json` — a list of cards:
+`captions.json` is a list of cards:
 
 ```json
 { "start": 5.89, "end": 7.31, "lines": ["🍑 KING!!"],
@@ -95,10 +143,14 @@ live preview shows). Each caption is colored by its speaker.
   "note": "gentle grow and vibrate of the text" }
 ```
 
-`fill` (the speaker's color) is written from the speakers file each time you
-save, so recoloring a speaker recolors all their words. `note` appears only on
-cards that have one. `lane` (0-based; omitted for the main timeline) says which
-timeline a caption is on — so a two-timeline file has some cards with
-`"lane": 1`. Cards are saved sorted by start time. Unknown fields are passed
-through untouched. (A timeline you've added but not put any caption on isn't
-stored in the file, so it won't come back after a reload.)
+- `fill` (the speaker's color) is rewritten from the speakers file on every
+  save.
+- `note` appears only on cards that have one.
+- `lane` (0-based) is omitted for the main timeline.
+- Cards are saved sorted by start time.
+- Unknown fields pass through untouched.
+- A timeline with no captions on it isn't stored, so it won't come back
+  after a reload.
+
+Files from older versions with `*note*` typed into the caption text are
+converted to the PROD NOTES field on load.
