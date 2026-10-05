@@ -19,8 +19,8 @@ shows where this editor fits in the whole stream → shorts process.
 
 ## The usual pass
 
-1. **Get a clip folder.** The video-editor pipeline writes one per short under
-   `E:\Streaming\Videos\CLIPS\<MM-DD-YYYY_GAME>\<clip>\`, containing
+1. **Get a clip folder.** The video-editor pipeline writes one per short in the deliverables
+   folder, at `CLIPS/<MM-DD-YYYY_GAME>/<clip>/`, containing
    `<clip>.mp4` and `captions.json` (one word per card). The captions come
    either straight from the VOD transcript or, for a hand re-cut, from a
    transcription of the rendered short itself.
