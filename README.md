@@ -14,6 +14,15 @@ starts the server; right-click it for Open / Restart / Quit), or
 **Load:** pick the video, its `captions.json` (a list of timed cards) and,
 optionally, a speakers file. Saving writes straight back to those same files.
 
+**Caption font:** the dropdown above the speakers list picks which font
+`render_captions.py` uses for this job — Bebas Neue (the house style,
+condensed) or one of four wider/heavier faces chosen for raw legibility at
+small mobile caption sizes: Montserrat Black, Anton, Archivo Black, Poppins
+ExtraBold. It's saved into the speakers file as `{"font": "...", "speakers":
+[...]}` (a speakers file saved by an older version of this editor — a plain
+array — still loads fine; it just has no font opinion, so the renderer
+defaults to Bebas Neue).
+
 ## Typing in a caption's text box
 
 | You type | It means |

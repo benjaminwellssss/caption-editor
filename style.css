@@ -81,6 +81,13 @@ button.danger:hover { background: #8a2f3c; }
 }
 
 .speakers-panel { margin-top: 16px; }
+.font-row { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.font-row label { font-size: 13px; color: #c0c4cc; }
+.font-row select {
+  background: #1e2126; border: 1px solid #33373f; color: #e6e8ec;
+  border-radius: 6px; padding: 5px 8px; font-size: 13px;
+}
+.font-row select:hover { border-color: #55606e; }
 .speakers-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .speakers-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .speaker-chip {

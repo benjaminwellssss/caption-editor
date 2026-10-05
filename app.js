@@ -14,6 +14,7 @@ const state = {
   // {_id, start, end, lines:[text], lane?, speaker: name|null, fill?, note?}
   cards: [],
   speakers: [],    // [{name, key, color}]  color = "#rrggbb"
+  font: "Bebas Neue", // saved into the speakers sidecar as {font, speakers}
   undoStack: [],   // each entry: {undo(), redo(), ...bookkeeping} — capped at MAX_HISTORY
   redoStack: [],
   dirty: false,
@@ -44,6 +45,11 @@ const DEFAULT_SPEAKERS = [
   { name: "Tony", key: "t", color: "#ffa552" },
   { name: "Mitch", key: "h", color: "#b0b6c0" },
 ];
+
+// Must match render_captions.py's FONTS dict keys exactly - that's what
+// actually resolves a name to a font file at render time.
+const FONTS = ["Bebas Neue", "Montserrat Black", "Anton", "Archivo Black", "Poppins ExtraBold"];
+const DEFAULT_FONT = "Bebas Neue";
 
 const HAS_FSA = "showOpenFilePicker" in window;
 if (!HAS_FSA) $("#fsaWarning").classList.remove("hidden");
@@ -187,10 +193,19 @@ async function loadProject() {
   }
 
   let speakers = [];
+  let font = DEFAULT_FONT;
   if (state.speakersHandle) {
     try {
       const spFile = await state.speakersHandle.getFile();
-      speakers = JSON.parse(await spFile.text());
+      const parsed = JSON.parse(await spFile.text());
+      // Old files saved by this editor are a plain speakers array; newer
+      // ones are {font, speakers} so the font choice has somewhere to live.
+      if (Array.isArray(parsed)) {
+        speakers = parsed;
+      } else {
+        speakers = parsed.speakers || [];
+        if (FONTS.includes(parsed.font)) font = parsed.font;
+      }
     } catch (e) {
       errEl.textContent = "Could not read/parse speakers.json: " + e.message;
       return;
@@ -220,6 +235,8 @@ async function loadProject() {
   state.laneCount = Math.max(1, ...state.cards.map((c) => laneOf(c) + 1));
   state.activeLane = 0;
   state.speakers = speakers;
+  state.font = font;
+  renderFontSelect();
   state.undoStack = [];
   state.redoStack = [];
   state.selection = new Set();
@@ -268,6 +285,17 @@ function renderSpeakers() {
 }
 
 $("#addSpeakerBtn").addEventListener("click", () => openSpeakerModal(null));
+
+function renderFontSelect() {
+  const sel = $("#fontSelect");
+  sel.innerHTML = FONTS.map((f) => `<option value="${f}">${f}</option>`).join("");
+  sel.value = state.font;
+}
+
+$("#fontSelect").addEventListener("change", (e) => {
+  state.font = e.target.value;
+  markDirty(true);
+});
 
 function openSpeakerModal(idx) {
   state.editingSpeakerIdx = idx;
@@ -1475,11 +1503,15 @@ $("#saveBtn").addEventListener("click", async () => {
     );
     if (!proceed) return;
   }
-  const emptyCount = state.cards.filter((c) => !c.lines.join("").trim()).length;
+  // A card with no text but a production note is a supported "silent"
+  // note-only card (drives an image overlay / fx / position change with
+  // nothing drawn on screen) — only a card with neither text nor a note is
+  // actually pointless and worth warning about.
+  const emptyCount = state.cards.filter((c) => !c.lines.join("").trim() && !c.note).length;
   if (emptyCount > 0) {
     const proceed = confirm(
-      `${emptyCount} caption${emptyCount > 1 ? "s have" : " has"} no text — an empty caption ` +
-      `will break the render. Save anyway? (Cancel to go back and fill it in or delete it.)`
+      `${emptyCount} caption${emptyCount > 1 ? "s have" : " has"} neither text nor a production note — ` +
+      `it won't do anything. Save anyway? (Cancel to go back and fill it in or delete it.)`
     );
     if (!proceed) return;
   }
@@ -1525,7 +1557,7 @@ $("#saveBtn").addEventListener("click", async () => {
     await cardsWritable.close();
 
     const spWritable = await state.speakersHandle.createWritable();
-    await spWritable.write(JSON.stringify(state.speakers, null, 2));
+    await spWritable.write(JSON.stringify({ font: state.font, speakers: state.speakers }, null, 2));
     await spWritable.close();
   } catch (e) {
     alert("Save failed: " + e.message);
