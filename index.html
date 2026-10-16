@@ -2,49 +2,54 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Caption Speaker Editor</title>
+<title>Cabtions</title>
+<link rel="icon" href="/assets/favicon.png">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
 <div id="setup" class="panel">
-  <h1>Caption Speaker Editor</h1>
-  <p class="hint">Pick a video file and its caption cards (and optionally an existing speakers config to reuse names/keys/colors across jobs). File dialogs are your normal Windows Explorer picker.</p>
-  <p id="fsaWarning" class="error hidden">This browser doesn't support native file picking (needs Chrome or Edge on Windows).</p>
+  <div class="brand big"><img src="/assets/cab.png" alt=""><span>CAB<b>TIONS</b></span></div>
+  <p class="hint">Pick a video and its caption cards. A speakers config is optional: reuse one from another job, or Cabtions makes one on first save.</p>
+  <p id="fsaWarning" class="error hidden">This browser can't open files directly. Use Chrome or Edge.</p>
 
-  <div class="picker-row">
-    <label>Video file</label>
-    <span id="videoPathLabel" class="picked-name">no file chosen</span>
-    <button data-pick="video">Choose…</button>
-  </div>
-  <div class="picker-row">
-    <label>Captions (cards.json)</label>
-    <span id="cardsPathLabel" class="picked-name">no file chosen</span>
-    <button data-pick="cards">Choose…</button>
-  </div>
-  <div class="picker-row">
-    <label>Speakers config <span class="hint">(optional — reuse from another job)</span></label>
-    <span id="speakersPathLabel" class="picked-name">none — will prompt to create on first save</span>
-    <button data-pick="speakers">Choose…</button>
+  <div class="setup-card">
+    <div class="picker-row">
+      <label>Video</label>
+      <span id="videoPathLabel" class="picked-name">no file chosen</span>
+      <button data-pick="video">Choose…</button>
+    </div>
+    <div class="picker-row">
+      <label>Captions <span class="hint">cards.json</span></label>
+      <span id="cardsPathLabel" class="picked-name">no file chosen</span>
+      <button data-pick="cards">Choose…</button>
+    </div>
+    <div class="picker-row">
+      <label>Speakers <span class="hint">optional</span></label>
+      <span id="speakersPathLabel" class="picked-name">none: made on first save</span>
+      <button data-pick="speakers">Choose…</button>
+    </div>
   </div>
 
   <button id="loadBtn" class="primary">Load</button>
   <div id="setupError" class="error"></div>
 </div>
 
-<div id="editor" class="panel hidden">
-  <div class="top-bar">
+<div id="editor" class="hidden">
+  <header class="top-bar">
+    <div class="brand"><img src="/assets/cab.png" alt=""><span>CAB<b>TIONS</b></span></div>
     <div id="projectLabel" class="project-label"></div>
     <div class="spacer"></div>
-    <span id="dirtyFlag" class="dirty-flag hidden">unsaved changes</span>
-    <button id="undoBtn" title="Undo (Backspace)">↶ Undo</button>
-    <button id="redoBtn" title="Redo (Shift+Backspace)">↷ Redo</button>
+    <span id="dirtyFlag" class="dirty-flag hidden">unsaved</span>
+    <button id="undoBtn" title="Undo">↶</button>
+    <button id="redoBtn" title="Redo">↷</button>
     <button id="saveBtn" class="primary">Save</button>
-    <button id="backToSetupBtn">Load different files</button>
-  </div>
+    <button id="backToSetupBtn" title="Load different files">Open…</button>
+    <button id="helpBtn" class="round" title="Keys and controls">?</button>
+  </header>
 
   <div class="main-grid">
-    <div class="video-col">
+    <section class="video-col">
       <div class="video-wrap">
         <video id="video" preload="metadata"></video>
         <div id="overlay" class="overlay"></div>
@@ -53,47 +58,48 @@
         <input id="seekBar" type="range" min="0" max="1000" value="0" step="1">
         <span id="timeLabel">0:00 / 0:00</span>
       </div>
-      <div class="hotkey-help">
-        <b>Space</b> play/pause &nbsp; <b>&lt;</b> -5s &nbsp; <b>&gt;</b> +5s &nbsp;
-        <b>Enter</b> restart (keeps data) &nbsp; <b>Backspace</b> undo last (last 10) &nbsp; <b>Shift+Backspace</b> redo &nbsp;<br>
-drag the <b>☰</b> handle to select a range, click one to select just that word, <b>Shift</b>-click a handle to extend to it, <b>Ctrl</b>-click to add/remove one &nbsp;
-        press a speaker key to tag the current word (or the whole selection, which then clears) &nbsp; <b>Esc</b> clear selection<br>
-        each row: <b>▶</b> seek, start/end time (seconds, editable), the caption text (<b>|</b> = line break, <b>HECK|YES</b> puts YES under HECK), the amber <b>PROD NOTES</b> field (instructions for whoever renders it - effects, colors, image overlays - <i>never shown</i> in the video itself), <b>T1/T2…</b> which timeline it's on, <b>😀</b> insert emoji, <b>+</b> insert a blank caption after it, <b>✕</b> delete it<br>
-        <b>🕒+ Timeline</b> adds another lane so captions can overlap: the main timeline shows big, extra ones stack smaller beneath it (several speakers at once)
-      </div>
       <div id="selectionStatus" class="selection-status hidden"></div>
 
-      <div class="speakers-panel">
-        <div class="speakers-header">
+      <div class="card speakers-panel">
+        <div class="panel-head">
           <h3>Speakers</h3>
-          <button id="addSpeakerBtn">+ Add</button>
+          <button id="addSpeakerBtn" class="small">+ Add</button>
         </div>
         <div id="speakersList" class="speakers-list"></div>
         <div class="font-row">
-          <label for="fontSelect">Caption font</label>
+          <label for="fontSelect">Font</label>
           <select id="fontSelect"></select>
+          <button id="fontPickerBtn" class="small" title="Browse installed fonts and pick favourites">Fonts…</button>
         </div>
       </div>
-    </div>
+    </section>
 
-    <div class="words-col">
-      <div class="timeline-panel">
-        <div class="tl-header">
+    <section class="work-col">
+      <div class="card timeline-panel">
+        <div class="panel-head">
           <h3>Timelines</h3>
-          <span class="tl-hint">drag a caption to slide it · drag its edges to resize · <b>←/→</b> bump 1 frame (<b>Shift</b> = 10) · <b>↑/↓</b> change timeline · <b>Alt</b>-drag = no snapping · <b>Ctrl</b>+wheel zooms</span>
-          <button id="tlZoomOut" title="Zoom out">−</button>
-          <button id="tlZoomIn" title="Zoom in">+</button>
-          <button id="addLaneBtn" title="Add another timeline, so captions can overlap (several speakers at once)">🕒+ Timeline</button>
+          <div class="spacer"></div>
+          <button id="tlZoomOut" class="small" title="Zoom out">−</button>
+          <input id="tlZoom" type="range" min="0" max="1000" value="400" title="Zoom (centres on the playhead)">
+          <button id="tlZoomIn" class="small" title="Zoom in">+</button>
+          <button id="catchBtn" class="small" title="Jump the timeline and caption list to the playhead and keep following it">⦿ Catch playhead</button>
+          <div class="menu-wrap">
+            <button id="lanesBtn" class="small">Show timelines ▾</button>
+            <div id="lanesMenu" class="menu hidden"></div>
+          </div>
         </div>
         <div id="tlScroll" class="tl-scroll"><div id="tlContent" class="tl-content"></div></div>
       </div>
-      <div class="words-header">
-        <h3>Captions</h3>
-        <button id="addCaptionBtn" title="Insert a new blank caption at the current playhead time">+ Add caption</button>
-        <button id="followToggle" class="follow-toggle">🔒 Following video</button>
+
+      <div class="card words-panel">
+        <div class="panel-head">
+          <h3>Captions</h3>
+          <div class="spacer"></div>
+          <button id="addCaptionBtn" class="small" title="Insert a blank caption at the playhead">+ Add caption</button>
+        </div>
+        <div id="wordsList" class="words-list"></div>
       </div>
-      <div id="wordsList" class="words-list"></div>
-    </div>
+    </section>
   </div>
 </div>
 
@@ -103,12 +109,12 @@ drag the <b>☰</b> handle to select a range, click one to select just that word
   <div class="modal-box small">
     <div class="modal-header">
       <span id="speakerModalTitle">Add speaker</span>
-      <button id="speakerModalClose">×</button>
+      <button id="speakerModalClose" class="ghost">×</button>
     </div>
     <div class="speaker-form">
       <label>Name <input id="spName" type="text" maxlength="40"></label>
       <label>Hotkey <input id="spKey" type="text" maxlength="1"></label>
-      <label>Color <input id="spColor" type="color" value="#8cff78"></label>
+      <label>Colour <input id="spColor" type="color" value="#8cff78"></label>
       <div id="speakerFormError" class="error"></div>
       <div class="speaker-form-actions">
         <button id="spDelete" class="danger hidden">Delete</button>
@@ -116,6 +122,71 @@ drag the <b>☰</b> handle to select a range, click one to select just that word
         <button id="spCancel">Cancel</button>
         <button id="spSave" class="primary">Save</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<div id="fontModal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span>Fonts</span>
+      <button id="fontModalClose" class="ghost">×</button>
+    </div>
+    <div class="font-tools">
+      <input id="fontSearch" type="text" placeholder="Search installed fonts…">
+      <input id="fontSample" type="text" value="HOP IN THE CAB, BRO" title="Preview text">
+    </div>
+    <p class="hint pad">★ adds a font to the Font dropdown. Click a name to use it for this video.</p>
+    <div id="fontList" class="font-list"></div>
+  </div>
+</div>
+
+<div id="helpModal" class="modal hidden">
+  <div class="modal-box wide">
+    <div class="modal-header">
+      <span>Keys and controls</span>
+      <button id="helpModalClose" class="ghost">×</button>
+    </div>
+    <div class="help-body">
+      <h4>Playback</h4>
+      <dl>
+        <dt>Space</dt><dd>play / pause</dd>
+        <dt>&lt; &gt;</dt><dd>back / forward 5 s</dd>
+        <dt>Enter</dt><dd>back to the start</dd>
+        <dt>⦿ Catch playhead</dt><dd>jump the timeline and the caption list to the playhead and follow it; scrolling either one by hand stops following</dd>
+      </dl>
+      <h4>Speakers</h4>
+      <dl>
+        <dt>speaker key</dt><dd>tag the current caption (or the whole selection). Tagged captions move to that speaker's own timeline, and a hidden speaker timeline appears the first time they're tagged</dd>
+        <dt>Speakers panel</dt><dd>click a speaker to edit its name, key or colour; the roster is remembered for next time</dd>
+      </dl>
+      <h4>Timeline</h4>
+      <dl>
+        <dt>drag a caption</dt><dd>slide it in time (snaps to frames; hold Alt for free)</dd>
+        <dt>Shift + drag</dt><dd>move it to another timeline without changing its time</dd>
+        <dt>drag its edges</dt><dd>trim the start or end</dd>
+        <dt>drag on empty space</dt><dd>box-select several captions (Ctrl adds to the selection)</dd>
+        <dt>click empty space / ruler</dt><dd>move the playhead there</dd>
+        <dt>double-click empty space</dt><dd>add a blank caption there</dd>
+        <dt>← →</dt><dd>nudge the selection 1 frame (Shift = 10)</dd>
+        <dt>↑ ↓</dt><dd>move the selection up / down a timeline</dd>
+        <dt>Delete</dt><dd>delete the selected captions</dd>
+        <dt>Ctrl + wheel, − / + , slider</dt><dd>zoom, always centred on the playhead</dd>
+        <dt>Show timelines</dt><dd>show or hide timelines, or add a new one</dd>
+      </dl>
+      <h4>Caption list</h4>
+      <dl>
+        <dt>☰ handle</dt><dd>click to select, drag for a range, Shift-click to extend, Ctrl-click to add or remove</dd>
+        <dt>▶</dt><dd>jump to that caption</dd>
+        <dt>text box</dt><dd>what shows in the video; <b>|</b> is a line break (HECK|YES)</dd>
+        <dt>PROD NOTES</dt><dd>instructions for whoever renders it (effects, colours, image links); never shown</dd>
+        <dt>😀 + ✕</dt><dd>insert emoji, add a caption after, delete</dd>
+      </dl>
+      <h4>Editing</h4>
+      <dl>
+        <dt>Backspace / Shift + Backspace</dt><dd>undo / redo (last 10 steps)</dd>
+        <dt>Esc</dt><dd>clear the selection</dd>
+      </dl>
     </div>
   </div>
 </div>

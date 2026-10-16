@@ -1,8 +1,9 @@
 "use strict";
 
 const FPS = 30;              // frame step for snapping and arrow-key bumps
-const LABEL_W = 96;          // width of the lane-label column in the timeline (matches style.css)
+const LABEL_W = 120;         // width of the lane-label column in the timeline (matches style.css)
 const MAX_HISTORY = 10;      // how many undo/redo steps are kept
+const PPS_MIN = 15, PPS_MAX = 600; // timeline zoom range, pixels per second
 
 const state = {
   videoHandle: null,
@@ -14,7 +15,12 @@ const state = {
   // {_id, start, end, lines:[text], lane?, speaker: name|null, fill?, note?}
   cards: [],
   speakers: [],    // [{name, key, color}]  color = "#rrggbb"
-  font: "Bebas Neue", // saved into the speakers sidecar as {font, speakers}
+  // Timelines, top to bottom. A speaker's captions live on that speaker's timeline; a speaker who hasn't
+  // been tagged yet has no timeline ("hidden") until the first tag creates one. Saved card.lane is the index.
+  lanes: [{ name: "Main", speaker: null }],
+  font: "Bebas Neue", // saved into the speakers sidecar as {font, font_file?, speakers, lanes}
+  fontFile: null,     // full path when the font was picked from the installed-font list
+  favoriteFonts: [],  // [{family, file}] - app-wide, kept in the server's settings.json
   undoStack: [],   // each entry: {undo(), redo(), ...bookkeeping} — capped at MAX_HISTORY
   redoStack: [],
   dirty: false,
@@ -22,19 +28,20 @@ const state = {
   dragging: false,         // seek bar being dragged
   selection: new Set(),    // selected card _ids
   lastSelectedId: null,
-  followVideo: true,       // list + timeline follow the playing word
-  laneCount: 1,            // simultaneous-caption timelines (lane 0 = main)
+  followVideo: true,       // list + timeline follow the playhead until you scroll them by hand
   activeLane: 0,           // where "+ Add caption" puts a new caption
   pps: 80,                 // timeline zoom, pixels per second
+  peaks: null,             // audio waveform: Float32Array of peak levels, PEAK_RATE per second
 };
 let nextId = 1;
+const PEAK_RATE = 200;
 
 const $ = (sel) => document.querySelector(sel);
 const video = () => $("#video");
+const laneCount = () => state.lanes.length;
 
-// Pre-filled roster for a brand-new project (no existing speakers.json
-// picked, or an empty one) — fully editable afterward, just a starting
-// point so a fresh job doesn't start from zero.
+// Starting roster for a brand-new project when no speakers config was picked and none is remembered
+// from last time (settings.json) - fully editable afterward.
 const DEFAULT_SPEAKERS = [
   { name: "Ben", key: "b", color: "#8cff78" },
   { name: "Jared", key: "j", color: "#ffd600" },
@@ -46,8 +53,8 @@ const DEFAULT_SPEAKERS = [
   { name: "Mitch", key: "h", color: "#b0b6c0" },
 ];
 
-// Must match render_captions.py's FONTS dict keys exactly - that's what
-// actually resolves a name to a font file at render time.
+// Fonts the renderer (render_captions.py's FONTS) knows by name alone. Any other font is saved with its
+// file path (font_file) so the renderer can load it directly.
 const FONTS = ["Bebas Neue", "Montserrat Black", "Anton", "Archivo Black", "Poppins ExtraBold"];
 const DEFAULT_FONT = "Bebas Neue";
 
@@ -65,17 +72,17 @@ function fmtTime(t) {
 
 function hexToRgba(hex) {
   const h = hex.replace("#", "");
-  const r = parseInt(h.substring(0, 2), 16);
-  const g = parseInt(h.substring(2, 4), 16);
-  const b = parseInt(h.substring(4, 6), 16);
-  return [r, g, b, 255];
+  return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16), 255];
 }
+
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 function speakerByName(name) {
   return state.speakers.find((s) => s.name === name);
 }
 
 const laneOf = (card) => card.lane || 0;
+const setLane = (card, lane) => { if (lane) card.lane = lane; else delete card.lane; };
 const cardById = (id) => state.cards.find((c) => c._id === id);
 const idxById = (id) => state.cards.findIndex((c) => c._id === id);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -86,15 +93,41 @@ function sortCards() {
 
 const orderKey = () => state.cards.map((c) => c._id).join(",");
 
+// ---------- app-wide settings (speaker roster, favourite fonts) ----------
+// Kept by server.py in settings.json, so they survive closing the editor. Saved on every change and once
+// more on exit.
+
+let settings = {};
+let settingsTimer = null;
+
+async function loadSettings() {
+  try { settings = await (await fetch("/settings")).json(); } catch { settings = {}; }
+  state.favoriteFonts = Array.isArray(settings.favoriteFonts) ? settings.favoriteFonts : [];
+}
+
+function settingsPayload() {
+  return JSON.stringify({ speakers: state.speakers, favoriteFonts: state.favoriteFonts });
+}
+
+function saveSettingsSoon() {
+  clearTimeout(settingsTimer);
+  settingsTimer = setTimeout(() => {
+    fetch("/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: settingsPayload() })
+      .catch(() => {});
+  }, 400);
+}
+
+window.addEventListener("pagehide", () => {
+  if (state.speakers.length) navigator.sendBeacon("/settings", new Blob([settingsPayload()], { type: "application/json" }));
+});
+
+loadSettings();
+
 // ---------- editor text syntax ----------
 // The caption text box holds only what's displayed on screen:
 //   |  -> a line break: "HECK|YES" shows HECK above YES.
-// Production notes (instructions for whoever renders the video - effects,
-// colors, image overlays, etc.) live in their own dedicated field next to
-// it, saved to card.note. They used to be typed inline as *like this* in
-// the caption box itself; parseEditorText/applyEditorText below still pull
-// a stray *note* out of pasted/legacy text as a migration safety net (see
-// loadProject), but the notes field is now the actual way to write one.
+// Production notes live in their own field (card.note). A stray *note* typed into the caption box (legacy
+// files) is still pulled out into card.note as a migration safety net.
 
 function parseEditorText(raw) {
   const notes = [];
@@ -108,20 +141,12 @@ function parseEditorText(raw) {
   return { lines, note: notes.length ? notes.join("; ") : null };
 }
 
-function cardEditorText(card) {
-  return card.lines.join("|");
-}
-
-function cardNotesText(card) {
-  return card.note || "";
-}
+const cardEditorText = (card) => card.lines.join("|");
+const cardNotesText = (card) => card.note || "";
 
 function applyEditorText(card, raw) {
   const parsed = parseEditorText(raw);
   card.lines = parsed.lines;
-  // Notes are edited in their own field now - only touch card.note here as a
-  // migration safety net when a stray *note* actually shows up in the caption
-  // box (pasted-in legacy text); otherwise leave whatever's already there alone.
   if (parsed.note) card.note = parsed.note;
 }
 
@@ -152,8 +177,8 @@ document.querySelectorAll("[data-pick]").forEach((btn) => {
 });
 
 async function pickFile(target) {
-  if (!("showOpenFilePicker" in window)) {
-    alert("Native file picking needs Chrome or Edge on Windows.");
+  if (!HAS_FSA) {
+    alert("Opening files needs Chrome or Edge.");
     return;
   }
   const types = target === "video" ? VIDEO_TYPES : JSON_TYPES;
@@ -170,6 +195,61 @@ async function pickFile(target) {
   }
 }
 
+// ---------- timelines (lanes) model ----------
+
+// A layout snapshot - every card's speaker and timeline plus the timeline list - so any structural change
+// (tagging, showing/hiding timelines) undoes as one step.
+function snapshotLayout() {
+  return {
+    lanes: state.lanes.map((l) => ({ ...l })),
+    cards: new Map(state.cards.map((c) => [c._id, { speaker: c.speaker, lane: laneOf(c) }])),
+  };
+}
+
+function restoreLayout(snap) {
+  state.lanes = snap.lanes.map((l) => ({ ...l }));
+  state.cards.forEach((c) => {
+    const s = snap.cards.get(c._id);
+    if (s) { c.speaker = s.speaker; setLane(c, s.lane); }
+  });
+  state.activeLane = Math.min(state.activeLane, laneCount() - 1);
+  sortCards();
+  renderSpeakers(); renderWords(); renderTimeline();
+}
+
+function pushLayoutUndo(before) {
+  const after = snapshotLayout();
+  pushUndo({ undo: () => restoreLayout(before), redo: () => restoreLayout(after) });
+}
+
+// Lanes from a fresh caption file: one timeline per speaker, in speaker-roster order (so the first speaker
+// in the roster - the streamer - is the top, big-caption timeline), untagged captions on the top timeline.
+function organizeBySpeaker() {
+  const present = new Set(state.cards.map((c) => c.speaker).filter(Boolean));
+  const rank = (n) => { const i = state.speakers.findIndex((s) => s.name === n); return i < 0 ? 1e6 : i; };
+  const order = [...present].sort((a, b) => rank(a) - rank(b));
+  state.lanes = order.length ? order.map((n) => ({ name: n, speaker: n })) : [{ name: "Main", speaker: null }];
+  state.cards.forEach((c) => setLane(c, c.speaker ? order.indexOf(c.speaker) : 0));
+}
+
+// The timeline a speaker's captions go on - created ("unhidden") the first time they're tagged. An
+// unclaimed top timeline (no speaker yet) is taken over by the first speaker tagged.
+function laneForSpeaker(name) {
+  let i = state.lanes.findIndex((l) => l.speaker === name);
+  if (i >= 0) return i;
+  if (state.lanes[0].speaker === null && !state.cards.some((c) => c.speaker && laneOf(c) === 0 && c.speaker !== name)) {
+    state.lanes[0] = { name, speaker: name };
+    return 0;
+  }
+  state.lanes.push({ name, speaker: name });
+  return state.lanes.length - 1;
+}
+
+function laneColor(lane) {
+  const sp = lane && lane.speaker ? speakerByName(lane.speaker) : null;
+  return sp ? sp.color : "#59625d";
+}
+
 // ---------- load project ----------
 
 $("#loadBtn").addEventListener("click", loadProject);
@@ -179,49 +259,49 @@ async function loadProject() {
   errEl.textContent = "";
 
   if (!state.videoHandle || !state.cardsHandle) {
-    errEl.textContent = "Choose both a video file and a captions (cards.json) file.";
+    errEl.textContent = "Choose both a video and a captions (cards.json) file.";
     return;
   }
 
   let cards;
   try {
-    const cardsFile = await state.cardsHandle.getFile();
-    cards = JSON.parse(await cardsFile.text());
+    cards = JSON.parse(await (await state.cardsHandle.getFile()).text());
   } catch (e) {
-    errEl.textContent = "Could not read/parse cards.json: " + e.message;
+    errEl.textContent = "Could not read cards.json: " + e.message;
     return;
   }
 
   let speakers = [];
   let font = DEFAULT_FONT;
+  let fontFile = null;
+  let savedLanes = null;
   if (state.speakersHandle) {
     try {
-      const spFile = await state.speakersHandle.getFile();
-      const parsed = JSON.parse(await spFile.text());
-      // Old files saved by this editor are a plain speakers array; newer
-      // ones are {font, speakers} so the font choice has somewhere to live.
+      const parsed = JSON.parse(await (await state.speakersHandle.getFile()).text());
+      // Old files are a plain speakers array; newer ones are {font, font_file?, speakers, lanes?}.
       if (Array.isArray(parsed)) {
         speakers = parsed;
       } else {
         speakers = parsed.speakers || [];
-        if (FONTS.includes(parsed.font)) font = parsed.font;
+        if (parsed.font) font = parsed.font;
+        if (parsed.font_file) fontFile = parsed.font_file;
+        if (Array.isArray(parsed.lanes) && parsed.lanes.length) savedLanes = parsed.lanes;
       }
     } catch (e) {
-      errEl.textContent = "Could not read/parse speakers.json: " + e.message;
+      errEl.textContent = "Could not read speakers.json: " + e.message;
       return;
     }
   }
   if (speakers.length === 0) {
-    speakers = DEFAULT_SPEAKERS.map((s) => ({ ...s }));
+    speakers = (Array.isArray(settings.speakers) && settings.speakers.length ? settings.speakers : DEFAULT_SPEAKERS)
+      .map((s) => ({ ...s }));
   }
 
   if (!(await ensureReadWrite(state.cardsHandle))) {
-    errEl.textContent = "Write permission for cards.json was denied — can't save changes.";
+    errEl.textContent = "Write permission for cards.json was denied, so changes couldn't be saved.";
     return;
   }
 
-  // Files saved by an older version of this editor can have "*note*" typed
-  // straight into the caption text — pull those out into card.note now.
   let migrated = false;
   state.cards = cards.map((c) => {
     const card = { ...c, _id: nextId++, lines: [...c.lines], speaker: c.speaker || null };
@@ -231,12 +311,25 @@ async function loadProject() {
     if (JSON.stringify([card.lines, card.note || null]) !== before) migrated = true;
     return card;
   });
-  sortCards();
-  state.laneCount = Math.max(1, ...state.cards.map((c) => laneOf(c) + 1));
-  state.activeLane = 0;
   state.speakers = speakers;
+
+  const maxLane = Math.max(0, ...state.cards.map(laneOf));
+  if (savedLanes) {
+    state.lanes = savedLanes.map((l, i) => (typeof l === "string" ? { name: l, speaker: null } : { name: l.name || `Timeline ${i + 1}`, speaker: l.speaker || null }));
+  } else if (maxLane === 0) {
+    organizeBySpeaker(); // first open of a fresh caption file: put each speaker on their own timeline
+    if (state.cards.some((c) => laneOf(c) > 0)) migrated = true;
+  } else {
+    state.lanes = [];
+  }
+  while (state.lanes.length <= maxLane) state.lanes.push({ name: `Timeline ${state.lanes.length + 1}`, speaker: null });
+
+  sortCards();
+  state.activeLane = 0;
   state.font = font;
+  state.fontFile = fontFile;
   renderFontSelect();
+  applyOverlayFont();
   state.undoStack = [];
   state.redoStack = [];
   state.selection = new Set();
@@ -250,7 +343,7 @@ async function loadProject() {
   video().src = state.videoObjectUrl;
 
   $("#projectLabel").textContent =
-    `${videoFile.name}  —  ${state.cardsHandle.name}  —  speakers: ${state.speakersHandle ? state.speakersHandle.name : "(not yet created)"}`;
+    `${videoFile.name} · ${state.cardsHandle.name} · ${state.speakersHandle ? state.speakersHandle.name : "speakers: made on save"}`;
 
   $("#setup").classList.add("hidden");
   $("#editor").classList.remove("hidden");
@@ -259,15 +352,76 @@ async function loadProject() {
   renderWords();
   renderTimeline();
   renderSelectionStatus();
+  setFollow(true);
+  loadWaveform(videoFile);
 }
 
 $("#backToSetupBtn").addEventListener("click", () => {
-  if (state.dirty && !confirm("You have unsaved changes. Discard and load different files?")) return;
+  if (state.dirty && !confirm("You have unsaved changes. Discard them and open different files?")) return;
   $("#editor").classList.add("hidden");
   $("#setup").classList.remove("hidden");
 });
 
 video().addEventListener("loadedmetadata", () => renderTimeline());
+
+// ---------- audio waveform ----------
+// Decodes the video's own audio track in the browser and keeps one peak level per 1/PEAK_RATE s, so spikes
+// (sibilance, plosives, laughs) line up with the captions on the same time scale.
+
+async function loadWaveform(file) {
+  state.peaks = null;
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const audio = await ctx.decodeAudioData(await file.arrayBuffer());
+    ctx.close();
+    const n = Math.ceil(audio.duration * PEAK_RATE);
+    const peaks = new Float32Array(n);
+    const per = audio.sampleRate / PEAK_RATE;
+    for (let ch = 0; ch < audio.numberOfChannels; ch++) {
+      const data = audio.getChannelData(ch);
+      for (let i = 0; i < n; i++) {
+        let m = 0;
+        const a = Math.floor(i * per), b = Math.min(data.length, Math.floor((i + 1) * per));
+        for (let j = a; j < b; j++) { const v = Math.abs(data[j]); if (v > m) m = v; }
+        if (m > peaks[i]) peaks[i] = m;
+      }
+    }
+    state.peaks = peaks;
+    state.peaksMax = peaks.reduce((m, v) => Math.max(m, v), 0);
+  } catch (e) {
+    console.warn("waveform unavailable:", e);
+  }
+  drawWaveform();
+}
+
+function drawWaveform() {
+  const canvas = $("#tlWave");
+  if (!canvas) return;
+  const scroll = tlScroll();
+  const w = Math.max(1, scroll.clientWidth - LABEL_W);
+  const h = 44;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = w + "px";
+  canvas.style.left = scroll.scrollLeft + "px"; // the canvas only covers what's on screen
+  const g = canvas.getContext("2d");
+  g.scale(dpr, dpr);
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = "#59625d";
+  g.font = "10px Consolas, monospace";
+  if (!state.peaks) { g.fillText(state.videoObjectUrl ? "reading audio…" : "", 8, 26); return; }
+  g.fillStyle = "#39ff7a";
+  const mid = h / 2;
+  const top = state.peaksMax || 1;
+  for (let x = 0; x < w; x++) {
+    const t0 = (scroll.scrollLeft + x) / state.pps, t1 = (scroll.scrollLeft + x + 1) / state.pps;
+    let m = 0;
+    for (let i = Math.floor(t0 * PEAK_RATE); i <= Math.floor(t1 * PEAK_RATE) && i < state.peaks.length; i++) m = Math.max(m, state.peaks[i] || 0);
+    const a = (m / top) * (mid - 2); // linear, scaled to the loudest peak, so spikes stand out from speech
+    if (a > 0.3) g.fillRect(x, mid - a, 1, a * 2);
+  }
+}
 
 // ---------- speakers panel ----------
 
@@ -277,25 +431,14 @@ function renderSpeakers() {
   state.speakers.forEach((sp, idx) => {
     const chip = document.createElement("div");
     chip.className = "speaker-chip";
-    chip.innerHTML = `<span class="swatch" style="background:${sp.color}"></span>
-      <span class="key">${sp.key.toUpperCase()}</span> ${sp.name}`;
+    chip.innerHTML = `<span class="swatch" style="background:${sp.color};color:${sp.color}"></span>
+      <span class="key">${esc(sp.key.toUpperCase())}</span> ${esc(sp.name)}`;
     chip.onclick = () => openSpeakerModal(idx);
     list.appendChild(chip);
   });
 }
 
 $("#addSpeakerBtn").addEventListener("click", () => openSpeakerModal(null));
-
-function renderFontSelect() {
-  const sel = $("#fontSelect");
-  sel.innerHTML = FONTS.map((f) => `<option value="${f}">${f}</option>`).join("");
-  sel.value = state.font;
-}
-
-$("#fontSelect").addEventListener("change", (e) => {
-  state.font = e.target.value;
-  markDirty(true);
-});
 
 function openSpeakerModal(idx) {
   state.editingSpeakerIdx = idx;
@@ -315,18 +458,25 @@ function randomColor() {
   return palette[state.speakers.length % palette.length];
 }
 
+function blurFocused() {
+  // A display:none ancestor doesn't auto-blur a focused input in every browser - left focused,
+  // isTypingTarget() would keep swallowing every hotkey.
+  if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+}
+
 function closeSpeakerModal() {
   $("#speakerModal").classList.add("hidden");
-  // A display:none ancestor doesn't auto-blur a focused descendant input in
-  // every browser — left unblurred, isTypingTarget() would keep treating
-  // the (now hidden) field as focused and silently swallow every hotkey.
-  if (document.activeElement && document.activeElement !== document.body) {
-    document.activeElement.blur();
-  }
+  blurFocused();
 }
 
 $("#speakerModalClose").addEventListener("click", closeSpeakerModal);
 $("#spCancel").addEventListener("click", closeSpeakerModal);
+
+function afterSpeakersChange() {
+  markDirty();
+  saveSettingsSoon();
+  renderSpeakers(); renderWords(); renderTimeline();
+}
 
 $("#spSave").addEventListener("click", () => {
   const name = $("#spName").value.trim();
@@ -336,55 +486,33 @@ $("#spSave").addEventListener("click", () => {
 
   if (!name) { errEl.textContent = "Name is required."; return; }
   if (!key || key.length !== 1) { errEl.textContent = "Hotkey must be a single character."; return; }
-  const RESERVED = [" ", "enter", "backspace", "<", ">", ",", ".", "escape"];
-  if (RESERVED.includes(key)) { errEl.textContent = "That key is reserved for playback controls."; return; }
+  const RESERVED = [" ", "<", ">", ",", "."];
+  if (RESERVED.includes(key)) { errEl.textContent = "That key is used for playback."; return; }
 
   const dupe = state.speakers.find((s, i) => s.key === key && i !== state.editingSpeakerIdx);
-  if (dupe) { errEl.textContent = `"${key}" is already used by ${dupe.name}.`; return; }
-
+  if (dupe) { errEl.textContent = `"${key}" is already ${dupe.name}'s key.`; return; }
   const nameDupe = state.speakers.find((s, i) => s.name === name && i !== state.editingSpeakerIdx);
-  if (nameDupe) { errEl.textContent = `A speaker named "${name}" already exists.`; return; }
+  if (nameDupe) { errEl.textContent = `There's already a speaker named "${name}".`; return; }
 
+  const speakersBefore = state.speakers.map((s) => ({ ...s }));
+  const layoutBefore = snapshotLayout();
   if (state.editingSpeakerIdx === null) {
-    const newSp = { name, key, color };
-    state.speakers.push(newSp);
-    pushUndo({
-      undo: () => {
-        const i = state.speakers.indexOf(newSp);
-        if (i >= 0) state.speakers.splice(i, 1);
-        renderSpeakers(); renderWords(); renderTimeline();
-      },
-      redo: () => {
-        state.speakers.push(newSp);
-        renderSpeakers(); renderWords(); renderTimeline();
-      },
-    });
+    state.speakers.push({ name, key, color });
   } else {
-    const idx = state.editingSpeakerIdx;
-    const oldSp = { ...state.speakers[idx] };
-    const oldName = oldSp.name;
-    const newSp = { name, key, color };
-    const renamed = oldName !== name;
-    const renamedIds = renamed ? state.cards.filter((c) => c.speaker === oldName).map((c) => c._id) : [];
-    state.speakers[idx] = newSp;
-    if (renamed) renamedIds.forEach((id) => { const c = cardById(id); if (c) c.speaker = name; });
-    pushUndo({
-      undo: () => {
-        state.speakers[idx] = oldSp;
-        if (renamed) renamedIds.forEach((id) => { const c = cardById(id); if (c) c.speaker = oldName; });
-        renderSpeakers(); renderWords(); renderTimeline();
-      },
-      redo: () => {
-        state.speakers[idx] = newSp;
-        if (renamed) renamedIds.forEach((id) => { const c = cardById(id); if (c) c.speaker = name; });
-        renderSpeakers(); renderWords(); renderTimeline();
-      },
-    });
+    const oldName = state.speakers[state.editingSpeakerIdx].name;
+    state.speakers[state.editingSpeakerIdx] = { name, key, color };
+    if (oldName !== name) {
+      state.cards.forEach((c) => { if (c.speaker === oldName) c.speaker = name; });
+      state.lanes.forEach((l) => { if (l.speaker === oldName) { l.speaker = name; if (l.name === oldName) l.name = name; } });
+    }
   }
-  markDirty();
-  renderSpeakers();
-  renderWords();
-  renderTimeline();
+  const speakersAfter = state.speakers.map((s) => ({ ...s }));
+  const layoutAfter = snapshotLayout();
+  pushUndo({
+    undo: () => { state.speakers = speakersBefore.map((s) => ({ ...s })); restoreLayout(layoutBefore); saveSettingsSoon(); },
+    redo: () => { state.speakers = speakersAfter.map((s) => ({ ...s })); restoreLayout(layoutAfter); saveSettingsSoon(); },
+  });
+  afterSpeakersChange();
   closeSpeakerModal();
 });
 
@@ -392,34 +520,173 @@ $("#spDelete").addEventListener("click", () => {
   if (state.editingSpeakerIdx === null) return;
   const idx = state.editingSpeakerIdx;
   const sp = state.speakers[idx];
-  if (!confirm(`Delete speaker "${sp.name}"? Words already tagged with them will show as unassigned.`)) return;
+  if (!confirm(`Delete speaker "${sp.name}"? Captions already tagged with them will show as unassigned.`)) return;
   state.speakers.splice(idx, 1);
   pushUndo({
-    undo: () => {
-      state.speakers.splice(idx, 0, sp);
-      renderSpeakers(); renderWords(); renderTimeline();
-    },
-    redo: () => {
-      const i = state.speakers.indexOf(sp);
-      if (i >= 0) state.speakers.splice(i, 1);
-      renderSpeakers(); renderWords(); renderTimeline();
-    },
+    undo: () => { state.speakers.splice(idx, 0, sp); saveSettingsSoon(); renderSpeakers(); renderWords(); renderTimeline(); },
+    redo: () => { const i = state.speakers.indexOf(sp); if (i >= 0) state.speakers.splice(i, 1); saveSettingsSoon(); renderSpeakers(); renderWords(); renderTimeline(); },
   });
-  markDirty();
-  renderSpeakers();
-  renderWords();
-  renderTimeline();
+  afterSpeakersChange();
   closeSpeakerModal();
 });
 
-// ---------- follow-video toggle ----------
+// ---------- fonts ----------
 
-$("#followToggle").addEventListener("click", () => {
-  state.followVideo = !state.followVideo;
-  const btn = $("#followToggle");
-  btn.textContent = state.followVideo ? "🔒 Following video" : "🔓 Free scroll";
-  btn.classList.toggle("unlocked", !state.followVideo);
+let fontIndex = null; // /fonts list, fetched the first time the picker opens
+
+function renderFontSelect() {
+  const sel = $("#fontSelect");
+  const opts = FONTS.map((f) => ({ family: f, file: null }));
+  state.favoriteFonts.forEach((f) => { if (!opts.some((o) => o.family === f.family)) opts.push(f); });
+  if (!opts.some((o) => o.family === state.font)) opts.push({ family: state.font, file: state.fontFile });
+  sel.innerHTML = opts.map((o) => `<option value="${esc(o.family)}" data-file="${esc(o.file || "")}">${esc(o.family)}${o.file && !FONTS.includes(o.family) ? " ★" : ""}</option>`).join("");
+  sel.value = state.font;
+}
+
+function setFont(family, file) {
+  if (state.font === family && state.fontFile === file) return;
+  state.font = family;
+  state.fontFile = FONTS.includes(family) ? null : (file || null);
+  renderFontSelect();
+  applyOverlayFont();
+  markDirty(true);
+}
+
+$("#fontSelect").addEventListener("change", (e) => {
+  const opt = e.target.selectedOptions[0];
+  setFont(e.target.value, opt ? opt.dataset.file : null);
 });
+
+const loadedFaces = new Map();
+
+async function previewFace(i) {
+  if (!loadedFaces.has(i)) {
+    const face = new FontFace(`cabpv${i}`, `url(/fontfile?i=${i})`);
+    loadedFaces.set(i, face.load().then((f) => { document.fonts.add(f); return f; }).catch(() => null));
+  }
+  return loadedFaces.get(i);
+}
+
+async function applyOverlayFont() {
+  const overlay = $("#overlay");
+  overlay.style.fontFamily = `"${state.font}", Impact, "Arial Black", sans-serif`;
+  if (!state.fontFile) return;
+  const list = fontIndex || (fontIndex = await (await fetch("/fonts")).json().catch(() => []));
+  const i = list.findIndex((f) => f.file === state.fontFile);
+  if (i >= 0 && await previewFace(i)) overlay.style.fontFamily = `cabpv${i}, Impact, sans-serif`;
+}
+
+$("#fontPickerBtn").addEventListener("click", async () => {
+  $("#fontModal").classList.remove("hidden");
+  $("#fontSearch").focus();
+  if (!fontIndex) {
+    $("#fontList").innerHTML = `<p class="hint">Reading installed fonts…</p>`;
+    fontIndex = await (await fetch("/fonts")).json().catch(() => []);
+  }
+  renderFontList();
+});
+
+$("#fontModalClose").addEventListener("click", () => { $("#fontModal").classList.add("hidden"); blurFocused(); });
+$("#fontSearch").addEventListener("input", () => renderFontList());
+$("#fontSample").addEventListener("input", () => {
+  document.querySelectorAll(".font-item .fsample").forEach((el) => { el.textContent = $("#fontSample").value; });
+});
+
+const faceObserver = new IntersectionObserver((entries) => {
+  entries.forEach((en) => {
+    if (!en.isIntersecting) return;
+    const i = +en.target.dataset.i;
+    faceObserver.unobserve(en.target);
+    previewFace(i).then((f) => { if (f) en.target.querySelector(".fsample").style.fontFamily = `cabpv${i}`; });
+  });
+}, { root: $("#fontList") });
+
+function renderFontList() {
+  const q = $("#fontSearch").value.trim().toLowerCase();
+  const sample = esc($("#fontSample").value);
+  const seen = new Set();
+  const rows = [];
+  (fontIndex || []).forEach((f, i) => {
+    if (seen.has(f.family) || (q && !f.family.toLowerCase().includes(q))) return;
+    seen.add(f.family); // one row per family, its Regular (or first) style
+    rows.push({ ...f, i });
+  });
+  const shown = rows.slice(0, 250);
+  const list = $("#fontList");
+  list.innerHTML = shown.map((f) => {
+    const fav = state.favoriteFonts.some((x) => x.family === f.family);
+    return `<div class="font-item${f.family === state.font ? " current" : ""}" data-i="${f.i}">
+      <span class="star${fav ? " on" : ""}" title="Show in the Font dropdown">${fav ? "★" : "☆"}</span>
+      <span class="fname">${esc(f.family)}</span><span class="fsample">${sample}</span></div>`;
+  }).join("") + (rows.length > shown.length ? `<p class="hint">${rows.length - shown.length} more: type to narrow down</p>` : "");
+  list.querySelectorAll(".font-item").forEach((el) => {
+    const f = fontIndex[+el.dataset.i];
+    faceObserver.observe(el);
+    el.querySelector(".star").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const k = state.favoriteFonts.findIndex((x) => x.family === f.family);
+      if (k >= 0) state.favoriteFonts.splice(k, 1); else state.favoriteFonts.push({ family: f.family, file: f.file });
+      saveSettingsSoon();
+      renderFontSelect();
+      renderFontList();
+    });
+    el.addEventListener("click", () => { setFont(f.family, f.file); renderFontList(); });
+  });
+}
+
+// ---------- help ----------
+
+$("#helpBtn").addEventListener("click", () => $("#helpModal").classList.remove("hidden"));
+$("#helpModalClose").addEventListener("click", () => $("#helpModal").classList.add("hidden"));
+document.querySelectorAll(".modal").forEach((m) => m.addEventListener("mousedown", (e) => {
+  if (e.target === m && m.id !== "speakerModal") { m.classList.add("hidden"); blurFocused(); }
+}));
+
+// ---------- follow / catch playhead ----------
+// Following keeps the caption list and the timeline on the playhead. Scrolling either one by hand stops it;
+// "Catch playhead" jumps back and resumes. Both panels scroll inside themselves, never the page.
+
+let progScrollAt = 0; // when we last scrolled a panel ourselves, so our own scroll events don't cancel following
+
+function setFollow(on) {
+  state.followVideo = on;
+  $("#catchBtn").classList.toggle("on", on);
+}
+
+function progScroll(el, prop, value) {
+  progScrollAt = performance.now();
+  el[prop] = value;
+}
+
+function catchPlayhead() {
+  setFollow(true);
+  const scroll = tlScroll();
+  const x = video().currentTime * state.pps;
+  progScroll(scroll, "scrollLeft", Math.max(0, x - (scroll.clientWidth - LABEL_W) * 0.3));
+  const idx = currentCardIndex(video().currentTime);
+  if (idx >= 0) scrollRowIntoList(state.cards[idx]._id, true);
+}
+
+$("#catchBtn").addEventListener("click", catchPlayhead);
+
+["#wordsList", "#tlScroll"].forEach((sel) => {
+  $(sel).addEventListener("wheel", (e) => { if (!e.ctrlKey) setFollow(false); }, { passive: true });
+  $(sel).addEventListener("scroll", () => {
+    if (performance.now() - progScrollAt > 150 && state.followVideo && !tlDrag && !scrubbing && !marquee) setFollow(false);
+    if (sel === "#tlScroll") drawWaveform();
+  });
+});
+
+function scrollRowIntoList(id, center = false) {
+  const list = $("#wordsList");
+  const row = rowOf(id);
+  if (!row) return;
+  const top = row.offsetTop - list.offsetTop;
+  const bottom = top + row.offsetHeight;
+  if (center || top < list.scrollTop || bottom > list.scrollTop + list.clientHeight) {
+    progScroll(list, "scrollTop", Math.max(0, top - list.clientHeight / 2 + row.offsetHeight / 2));
+  }
+}
 
 // ---------- words panel ----------
 
@@ -427,7 +694,7 @@ function renderWords() {
   const list = $("#wordsList");
   const savedScroll = list.scrollTop;
   list.innerHTML = "";
-  list.classList.toggle("single-lane", state.laneCount <= 1);
+  list.classList.toggle("single-lane", laneCount() <= 1);
   state.cards.forEach((card) => list.appendChild(buildRow(card)));
   list.scrollTop = savedScroll;
 }
@@ -441,43 +708,38 @@ function buildRow(card) {
   const handle = document.createElement("span");
   handle.className = "row-handle";
   handle.textContent = "☰";
-  handle.title = "Click to select — drag for a range, Shift-click to extend, Ctrl-click to add/remove one";
+  handle.title = "Click to select - drag for a range, Shift-click to extend, Ctrl-click to add/remove";
   handle.addEventListener("mousedown", (e) => onHandleMouseDown(e, id));
   handle.addEventListener("mouseenter", () => onHandleMouseEnter(id));
 
   const seekBtn = document.createElement("button");
   seekBtn.className = "seek-btn";
   seekBtn.textContent = "▶";
-  seekBtn.title = "Jump video to this word's start";
+  seekBtn.title = "Jump to this caption";
   seekBtn.addEventListener("click", (e) => { e.stopPropagation(); video().currentTime = card.start; });
 
-  const startInput = document.createElement("input");
-  startInput.type = "number";
-  startInput.step = "0.01";
-  startInput.className = "time-input start-time";
-  startInput.value = card.start.toFixed(3);
-  startInput.title = "Start time (seconds)";
-  startInput.addEventListener("click", (e) => e.stopPropagation());
-  startInput.addEventListener("change", () => {
-    const next = parseFloat(startInput.value);
-    if (isNaN(next) || next < 0 || next >= card.end) { startInput.value = card.start.toFixed(3); return; }
+  const timeInput = (cls, value, title, onChange) => {
+    const el = document.createElement("input");
+    el.type = "number";
+    el.step = "0.01";
+    el.className = "time-input " + cls;
+    el.value = value.toFixed(3);
+    el.title = title;
+    el.addEventListener("click", (e) => e.stopPropagation());
+    el.addEventListener("change", () => onChange(el));
+    return el;
+  };
+  const startInput = timeInput("start-time", card.start, "Start (seconds)", (el) => {
+    const next = parseFloat(el.value);
+    if (isNaN(next) || next < 0 || next >= card.end) { el.value = card.start.toFixed(3); return; }
     applyMove([{ card, start: next, end: card.end, lane: laneOf(card) }], "edit");
   });
-
   const sep = document.createElement("span");
   sep.className = "time-sep";
   sep.textContent = "–";
-
-  const endInput = document.createElement("input");
-  endInput.type = "number";
-  endInput.step = "0.01";
-  endInput.className = "time-input end-time";
-  endInput.value = card.end.toFixed(3);
-  endInput.title = "End time (seconds)";
-  endInput.addEventListener("click", (e) => e.stopPropagation());
-  endInput.addEventListener("change", () => {
-    const next = parseFloat(endInput.value);
-    if (isNaN(next) || next <= card.start) { endInput.value = card.end.toFixed(3); return; }
+  const endInput = timeInput("end-time", card.end, "End (seconds)", (el) => {
+    const next = parseFloat(el.value);
+    if (isNaN(next) || next <= card.start) { el.value = card.end.toFixed(3); return; }
     applyMove([{ card, start: card.start, end: next, lane: laneOf(card) }], "edit");
   });
 
@@ -494,15 +756,10 @@ function buildRow(card) {
     applyEditorText(card, next);
     text.value = cardEditorText(card);
     const canonical = text.value;
+    const toLines = (s) => s.split("|").map((l) => l.replace(/\s+/g, " ").trim());
     pushUndo({
-      undo: () => {
-        const c = cardById(id);
-        if (c) { c.lines = prev.split("|").map((l) => l.replace(/\s+/g, " ").trim()); refreshRow(c); }
-      },
-      redo: () => {
-        const c = cardById(id);
-        if (c) { c.lines = canonical.split("|").map((l) => l.replace(/\s+/g, " ").trim()); refreshRow(c); }
-      },
+      undo: () => { const c = cardById(id); if (c) { c.lines = toLines(prev); refreshRow(c); } },
+      redo: () => { const c = cardById(id); if (c) { c.lines = toLines(canonical); refreshRow(c); } },
     });
     updateNoteChip(row, card);
     updateBlock(card);
@@ -512,9 +769,9 @@ function buildRow(card) {
   const notes = document.createElement("input");
   notes.className = "notes";
   notes.type = "text";
-  notes.placeholder = "Production notes (effects, colors, image overlays...)";
+  notes.placeholder = "effects, colours, image links…";
   notes.value = cardNotesText(card);
-  notes.title = "Instructions for whoever renders this caption - never shown in the video itself.";
+  notes.title = "Instructions for whoever renders this caption - never shown in the video.";
   notes.addEventListener("click", (e) => e.stopPropagation());
   notes.addEventListener("change", () => {
     const prev = cardNotesText(card);
@@ -544,13 +801,13 @@ function buildRow(card) {
 
   const laneSel = document.createElement("select");
   laneSel.className = "lane-select";
-  laneSel.title = "Which timeline this caption is on (simultaneous captions)";
-  for (let i = 0; i < state.laneCount; i++) {
+  laneSel.title = "Which timeline this caption is on";
+  state.lanes.forEach((l, i) => {
     const o = document.createElement("option");
     o.value = i;
-    o.textContent = `T${i + 1}`;
+    o.textContent = l.name;
     laneSel.appendChild(o);
-  }
+  });
   laneSel.value = String(laneOf(card));
   laneSel.addEventListener("change", () => {
     const lane = parseInt(laneSel.value, 10);
@@ -558,33 +815,23 @@ function buildRow(card) {
     applyMove([{ card, start: card.start, end: card.end, lane }], "edit");
   });
 
-  const emojiBtn = document.createElement("button");
-  emojiBtn.className = "row-icon-btn";
-  emojiBtn.textContent = "😀";
-  emojiBtn.title = "Insert emoji";
-  emojiBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openEmojiPicker(emojiBtn, text);
-  });
-
-  const insertBtn = document.createElement("button");
-  insertBtn.className = "row-icon-btn";
-  insertBtn.textContent = "+";
-  insertBtn.title = "Insert a new blank caption after this one";
-  insertBtn.addEventListener("click", (e) => { e.stopPropagation(); insertCardAfter(id); });
-
-  const deleteBtn = document.createElement("button");
-  deleteBtn.className = "row-icon-btn danger";
-  deleteBtn.textContent = "✕";
-  deleteBtn.title = "Delete this caption";
-  deleteBtn.addEventListener("click", (e) => { e.stopPropagation(); deleteCard(id); });
+  const iconBtn = (label, title, onClick, cls = "") => {
+    const b = document.createElement("button");
+    b.className = "row-icon-btn " + cls;
+    b.textContent = label;
+    b.title = title;
+    b.addEventListener("click", (e) => { e.stopPropagation(); onClick(b); });
+    return b;
+  };
+  const emojiBtn = iconBtn("😀", "Insert emoji", (b) => openEmojiPicker(b, text));
+  const insertBtn = iconBtn("+", "Add a blank caption after this one", () => insertCardAfter(id));
+  const deleteBtn = iconBtn("✕", "Delete this caption", () => deleteCards([id]), "danger");
 
   const notesArea = document.createElement("div");
   notesArea.className = "notes-area";
   notesArea.append(notesLabel, notes);
 
-  [handle, seekBtn, startInput, sep, endInput, text, notesArea, noteChip, badge, laneSel, emojiBtn, insertBtn, deleteBtn]
-    .forEach((el) => row.appendChild(el));
+  row.append(handle, seekBtn, startInput, sep, endInput, text, notesArea, noteChip, badge, laneSel, emojiBtn, insertBtn, deleteBtn);
   updateNoteChip(row, card);
   updateBadge(row, card);
   return row;
@@ -594,7 +841,7 @@ function updateNoteChip(row, card) {
   if (!row) return;
   const chip = row.querySelector(".note-chip");
   chip.classList.toggle("hidden", !card.note);
-  chip.textContent = card.note ? "📝 note" : "";
+  chip.textContent = card.note ? "📝" : "";
   chip.title = card.note || "";
 }
 
@@ -603,7 +850,7 @@ function updateBadge(row, card) {
   badge.textContent = card.speaker || "—";
   badge.className = "speaker-badge" + (card.speaker ? "" : " unassigned");
   const sp = card.speaker ? speakerByName(card.speaker) : null;
-  if (sp) { badge.style.background = sp.color; badge.style.color = "#101215"; }
+  if (sp) { badge.style.background = sp.color; badge.style.color = "#0b0e0c"; }
   else { badge.style.background = ""; badge.style.color = ""; }
 }
 
@@ -635,66 +882,49 @@ function addCard(card, focus = true) {
   state.cards.push(card);
   sortCards();
   pushUndo({
-    undo: () => {
-      const i = idxById(card._id);
-      if (i >= 0) state.cards.splice(i, 1);
-      clearSelection(); renderWords(); renderTimeline();
-    },
-    redo: () => {
-      state.cards.push(card);
-      sortCards();
-      clearSelection(); renderWords(); renderTimeline();
-    },
+    undo: () => { const i = idxById(card._id); if (i >= 0) state.cards.splice(i, 1); clearSelection(); renderWords(); renderTimeline(); },
+    redo: () => { state.cards.push(card); sortCards(); clearSelection(); renderWords(); renderTimeline(); },
   });
   markDirty();
   clearSelection();
   renderWords();
   renderTimeline();
-  const row = rowOf(card._id);
-  if (row && focus) {
-    row.scrollIntoView({ block: "center" });
-    row.querySelector(".text").focus();
+  if (focus) {
+    scrollRowIntoList(card._id, true);
+    const row = rowOf(card._id);
+    if (row) row.querySelector(".text").focus({ preventScroll: true });
   }
 }
 
-// Room before the next caption *on the same timeline*, so a new caption
-// doesn't land on top of a neighbour.
+// Room before the next caption *on the same timeline*, so a new caption doesn't land on a neighbour.
 function nextStartInLane(lane, after) {
   const nxt = state.cards.find((c) => laneOf(c) === lane && c.start > after);
   return nxt ? nxt.start : Infinity;
 }
 
+function blankCardAt(t, lane) {
+  const end = Math.max(Math.min(t + 0.3, nextStartInLane(lane, t)), t + 0.05);
+  const sp = state.lanes[lane] && state.lanes[lane].speaker;
+  return { start: t, end, lines: [""], speaker: sp || null, ...(lane ? { lane } : {}) };
+}
+
 function insertCardAfter(id) {
   const card = cardById(id);
-  const lane = laneOf(card);
-  const start = card.end;
-  let end = Math.min(start + 0.3, nextStartInLane(lane, card.start));
-  end = Math.max(end, start + 0.05);
-  addCard({ start, end, lines: [""], speaker: null, ...(lane ? { lane } : {}) });
+  addCard(blankCardAt(card.end, laneOf(card)));
 }
 
-function insertCardAtTime(t) {
-  const lane = state.activeLane;
-  let end = Math.min(t + 0.3, nextStartInLane(lane, t));
-  end = Math.max(end, t + 0.05);
-  addCard({ start: t, end, lines: [""], speaker: null, ...(lane ? { lane } : {}) });
+function insertCardAtTime(t, lane = state.activeLane) {
+  addCard(blankCardAt(Math.round(t * FPS) / FPS, lane));
 }
 
-function deleteCard(id) {
-  const idx = idxById(id);
-  if (idx < 0) return;
-  const [removed] = state.cards.splice(idx, 1);
+function deleteCards(ids) {
+  const removed = ids.map(cardById).filter(Boolean);
+  if (!removed.length) return;
+  const gone = new Set(removed.map((c) => c._id));
+  state.cards = state.cards.filter((c) => !gone.has(c._id));
   pushUndo({
-    undo: () => {
-      state.cards.push(removed);
-      sortCards();
-      clearSelection(); renderWords(); renderTimeline();
-    },
-    redo: () => {
-      const i = idxById(removed._id);
-      if (i >= 0) state.cards.splice(i, 1);
-      clearSelection(); renderWords(); renderTimeline();
-    },
+    undo: () => { state.cards.push(...removed); sortCards(); clearSelection(); renderWords(); renderTimeline(); },
+    redo: () => { state.cards = state.cards.filter((c) => !gone.has(c._id)); clearSelection(); renderWords(); renderTimeline(); },
   });
   markDirty();
   clearSelection();
@@ -711,7 +941,7 @@ const EMOJI_SET = [
   "💀", "🔥", "💯", "👍", "👎", "👏", "🙌", "🤝", "🙏", "💪", "🤡", "🎮",
   "🎉", "🎂", "🍻", "🍺", "💰", "🪓", "⚔️", "🛡️", "🏆", "⭐", "✨", "💥",
   "⚡", "❤️", "💚", "💛", "💙", "💜", "🖤", "🤍", "🚫", "❌", "✅", "❓",
-  "❗", "😅", "🤯", "🫡", "🍑",
+  "❗", "😅", "🤯", "🫡", "🍑", "🤓", "☝️", "🚕",
 ];
 
 const emojiPickerEl = $("#emojiPicker");
@@ -728,8 +958,8 @@ EMOJI_SET.forEach((em) => {
 function openEmojiPicker(triggerBtn, targetInput) {
   emojiTargetInput = targetInput;
   const rect = triggerBtn.getBoundingClientRect();
-  emojiPickerEl.style.left = Math.min(rect.left, window.innerWidth - 290) + "px";
-  emojiPickerEl.style.top = (rect.bottom + 4) + "px";
+  emojiPickerEl.style.left = Math.min(rect.left, window.innerWidth - 380) + "px";
+  emojiPickerEl.style.top = Math.min(rect.bottom + 4, window.innerHeight - 230) + "px";
   emojiPickerEl.classList.remove("hidden");
 }
 
@@ -745,17 +975,15 @@ function insertEmoji(em) {
   const end = input.selectionEnd ?? input.value.length;
   input.value = input.value.slice(0, start) + em + input.value.slice(end);
   const newPos = start + em.length;
-  input.focus();
+  input.focus({ preventScroll: true });
   input.setSelectionRange(newPos, newPos);
-  // reuses the existing "change" listener's prev/next diff + undo push
-  input.dispatchEvent(new Event("change", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true })); // reuses the field's diff + undo push
   closeEmojiPicker();
 }
 
 document.addEventListener("click", (e) => {
-  if (!emojiPickerEl.classList.contains("hidden") && !emojiPickerEl.contains(e.target)) {
-    closeEmojiPicker();
-  }
+  if (!emojiPickerEl.classList.contains("hidden") && !emojiPickerEl.contains(e.target)) closeEmojiPicker();
+  if (!$("#lanesMenu").classList.contains("hidden") && !e.target.closest(".menu-wrap")) $("#lanesMenu").classList.add("hidden");
 });
 
 // ---------- selection (shared by the list and the timeline) ----------
@@ -776,7 +1004,7 @@ function applySelectionClasses() {
 function renderSelectionStatus() {
   const el = $("#selectionStatus");
   if (state.selection.size > 1) {
-    el.textContent = `${state.selection.size} captions selected — a speaker key tags them all, ←/→ bump their timing, drag any of them on the timeline, Esc to clear`;
+    el.textContent = `${state.selection.size} selected · speaker key tags all · Delete removes · Esc clears`;
     el.classList.remove("hidden");
   } else {
     el.classList.add("hidden");
@@ -787,16 +1015,14 @@ function clearSelection() {
   setSelection([], null);
 }
 
-// ---------- list drag-to-select (via the row-handle grip only, never the
-// text or times, so a selection drag can't turn into a native text
-// selection or collide with editing/seeking) ----------
+// ---------- list drag-to-select (via the row handle only, so it can't become a text selection) ----------
 
 let dragAnchorPos = null; // position in state.cards (sorted order)
 let dragAdditive = false;
 let dragBaseSelection = null;
 
 function onHandleMouseDown(e, id) {
-  e.preventDefault(); // stop the drag from starting a native text selection
+  e.preventDefault();
   const pos = idxById(id);
   const lastPos = state.lastSelectedId === null ? -1 : idxById(state.lastSelectedId);
   if (e.shiftKey && lastPos >= 0) {
@@ -820,7 +1046,7 @@ function onHandleMouseDown(e, id) {
 }
 
 function onHandleMouseEnter(id) {
-  if (dragAnchorPos === null) return; // not mid-drag
+  if (dragAnchorPos === null) return;
   applyDragRange(idxById(id));
 }
 
@@ -837,11 +1063,9 @@ document.addEventListener("mouseup", () => {
 });
 
 // ---------- moving captions (timeline drag, arrow keys, list edits) ----------
-// Every change to a caption's start/end/lane goes through applyMove so it is
-// undoable, keeps the list sorted, and updates the timeline.
+// Every change to a caption's start/end/lane goes through applyMove (or the drag commit) so it is undoable,
+// keeps the list sorted, and updates the timeline.
 
-// Re-applies a set of {id, start, end, lane} snapshots — shared by every
-// undo/redo closure that reverts or reapplies a timing change.
 function applyItemSnapshots(items) {
   const cs = [];
   items.forEach((it) => {
@@ -849,13 +1073,13 @@ function applyItemSnapshots(items) {
     if (!c) return;
     c.start = it.start;
     c.end = it.end;
-    if (it.lane) c.lane = it.lane; else delete c.lane;
+    setLane(c, it.lane);
     cs.push(c);
   });
   afterTimingChange(cs);
 }
 
-// changes: [{card, start, end, lane}]. kind: "edit" | "drag" | "nudge".
+// changes: [{card, start, end, lane}]. kind: "edit" | "nudge".
 function applyMove(changes, kind) {
   const prevItems = [];
   const nextItems = [];
@@ -867,7 +1091,7 @@ function applyMove(changes, kind) {
     nextItems.push({ id: c._id, start: ch.start, end: ch.end, lane: ch.lane });
     c.start = ch.start;
     c.end = ch.end;
-    if (ch.lane) c.lane = ch.lane; else delete c.lane;
+    setLane(c, ch.lane);
     changed.push(c);
   }
   if (!changed.length) return;
@@ -875,8 +1099,7 @@ function applyMove(changes, kind) {
   const mergeKey = prevItems.map((i) => i.id).join(",");
   const last = state.undoStack[state.undoStack.length - 1];
   if (kind === "nudge" && last && last._nudgeKey === mergeKey && Date.now() - last._t < 900) {
-    // holding an arrow key is one undo step, not thirty — keep the original
-    // undo (back to before the hold began), just extend what redo replays
+    // holding an arrow key is one undo step, not thirty
     last._t = Date.now();
     last.redo = () => applyItemSnapshots(nextItems);
   } else {
@@ -899,23 +1122,16 @@ function afterTimingChange(changed) {
   renderTimeline();
 }
 
-// Bump the selected captions by dt seconds and/or dl lanes. Returns whether
-// anything was selected.
 function nudgeSelection(dt, dl) {
   const cards = [...state.selection].map(cardById).filter(Boolean);
   if (!cards.length) return false;
-  const minStart = Math.min(...cards.map((c) => c.start));
-  const t = Math.max(dt, -minStart);
-  const minLane = Math.min(...cards.map(laneOf));
-  const maxLane = Math.max(...cards.map(laneOf));
-  const l = clamp(dl, -minLane, state.laneCount - 1 - maxLane);
-  applyMove(cards.map((c) => ({
-    card: c, start: c.start + t, end: c.end + t, lane: laneOf(c) + l,
-  })), "nudge");
+  const t = Math.max(dt, -Math.min(...cards.map((c) => c.start)));
+  const l = clamp(dl, -Math.min(...cards.map(laneOf)), laneCount() - 1 - Math.max(...cards.map(laneOf)));
+  applyMove(cards.map((c) => ({ card: c, start: c.start + t, end: c.end + t, lane: laneOf(c) + l })), "nudge");
   return true;
 }
 
-// ---------- timelines (lanes) ----------
+// ---------- timeline view ----------
 
 const tlScroll = () => $("#tlScroll");
 const tlContent = () => $("#tlContent");
@@ -934,11 +1150,18 @@ function renderTimeline() {
   const width = Math.ceil(timelineSeconds() * state.pps);
   content.style.width = (LABEL_W + width) + "px";
 
+  const row = (labelHtml, labelCls, el) => {
+    const r = document.createElement("div");
+    r.className = "tl-row";
+    const label = document.createElement("div");
+    label.className = "tl-label " + labelCls;
+    label.innerHTML = labelHtml;
+    r.append(label, el);
+    content.appendChild(r);
+    return label;
+  };
+
   // ruler
-  const rulerRow = document.createElement("div");
-  rulerRow.className = "tl-row tl-ruler-row";
-  const corner = document.createElement("div");
-  corner.className = "tl-label tl-corner";
   const ruler = document.createElement("div");
   ruler.className = "tl-ruler";
   ruler.style.width = width + "px";
@@ -951,41 +1174,34 @@ function renderTimeline() {
     ruler.appendChild(tick);
   }
   ruler.addEventListener("mousedown", (e) => startScrub(e, ruler));
-  rulerRow.append(corner, ruler);
-  content.appendChild(rulerRow);
+  row("", "tl-corner", ruler);
 
-  // lanes
-  for (let lane = 0; lane < state.laneCount; lane++) {
-    const row = document.createElement("div");
-    row.className = "tl-row";
-    const label = document.createElement("div");
-    label.className = "tl-label" + (lane === state.activeLane ? " active" : "");
-    label.textContent = lane === 0 ? "Timeline 1" : `Timeline ${lane + 1}`;
-    label.title = "Click to make this the timeline “+ Add caption” uses";
-    label.addEventListener("click", () => { state.activeLane = lane; renderTimeline(); });
-    if (lane > 0 && lane === state.laneCount - 1) {
-      const rm = document.createElement("button");
-      rm.className = "tl-lane-remove";
-      rm.textContent = "✕";
-      rm.title = "Remove this timeline";
-      rm.addEventListener("click", (e) => { e.stopPropagation(); removeLastLane(); });
-      label.appendChild(rm);
-    }
+  // waveform
+  const wave = document.createElement("div");
+  wave.className = "tl-wave";
+  wave.style.width = width + "px";
+  wave.innerHTML = `<canvas id="tlWave"></canvas>`;
+  wave.addEventListener("mousedown", (e) => startScrub(e, wave));
+  row("Audio", "tl-wave-label", wave);
+
+  // speaker / caption timelines
+  state.lanes.forEach((ln, lane) => {
     const track = document.createElement("div");
     track.className = "tl-lane-track";
     track.dataset.lane = lane;
     track.style.width = width + "px";
-    track.addEventListener("mousedown", (e) => {
+    track.addEventListener("mousedown", (e) => { if (e.target === track) onTrackMouseDown(e, lane, track); });
+    track.addEventListener("dblclick", (e) => {
       if (e.target !== track) return;
-      state.activeLane = lane;
-      clearSelection();
-      startScrub(e, track);
-      document.querySelectorAll(".tl-label").forEach((l, i) => l.classList.toggle("active", i - 1 === lane));
+      insertCardAtTime((e.clientX - track.getBoundingClientRect().left) / state.pps, lane);
     });
-    state.cards.forEach((card) => { if (Math.min(laneOf(card), state.laneCount - 1) === lane) track.appendChild(makeBlock(card)); });
-    row.append(label, track);
-    content.appendChild(row);
-  }
+    state.cards.forEach((card) => { if (Math.min(laneOf(card), laneCount() - 1) === lane) track.appendChild(makeBlock(card)); });
+    const color = laneColor(ln);
+    const label = row(`<span class="dot" style="background:${color};color:${color}"></span>${esc(ln.name)}`,
+      lane === state.activeLane ? "active" : "", track);
+    label.title = "Click: “+ Add caption” uses this timeline";
+    label.addEventListener("click", () => { state.activeLane = lane; renderTimeline(); });
+  });
 
   const ph = document.createElement("div");
   ph.id = "tlPlayhead";
@@ -994,12 +1210,12 @@ function renderTimeline() {
   scroll.scrollLeft = sl;
   scroll.scrollTop = st;
   placePlayhead();
-  renderOverlayLanes();
+  drawWaveform();
 }
 
 function blockColors(card) {
   const sp = card.speaker ? speakerByName(card.speaker) : null;
-  return sp ? { bg: sp.color, fg: "#101215" } : { bg: "#4b5468", fg: "#f1f3f7" };
+  return sp ? { bg: sp.color, fg: "#0b0e0c" } : { bg: "#3a423e", fg: "#e3e8e5" };
 }
 
 function makeBlock(card) {
@@ -1024,8 +1240,7 @@ function positionBlock(b, card) {
   b.style.width = Math.max(6, (card.end - card.start) * state.pps) + "px";
   b.style.background = bg;
   b.style.color = fg;
-  b.title = `${card.lines.join(" / ")}\n${card.start.toFixed(2)}s – ${card.end.toFixed(2)}s` +
-    (card.note ? `\n📝 ${card.note}` : "");
+  b.title = `${card.lines.join(" / ")}\n${card.start.toFixed(2)}s – ${card.end.toFixed(2)}s` + (card.note ? `\n📝 ${card.note}` : "");
   b.querySelector(".tl-text").textContent = card.lines.join(" / ") + (card.note ? " 📝" : "");
 }
 
@@ -1047,7 +1262,7 @@ function placePlayhead() {
   if (ph) ph.style.left = (LABEL_W + video().currentTime * state.pps) + "px";
 }
 
-// -- ruler / empty-lane scrubbing --
+// -- ruler / waveform scrubbing --
 
 let scrubbing = null;
 function startScrub(e, el) {
@@ -1060,12 +1275,64 @@ function scrubTo(clientX) {
   if (!scrubbing) return;
   const rect = scrubbing.getBoundingClientRect();
   const dur = video().duration;
-  const t = clamp((clientX - rect.left) / state.pps, 0, isFinite(dur) ? dur : Infinity);
-  video().currentTime = t;
+  video().currentTime = clamp((clientX - rect.left) / state.pps, 0, isFinite(dur) ? dur : Infinity);
   placePlayhead();
 }
 
+// -- empty timeline space: click = move the playhead, drag = box-select --
+
+let marquee = null;
+
+function onTrackMouseDown(e, lane, track) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  state.activeLane = lane;
+  document.querySelectorAll(".tl-label").forEach((l) => l.classList.remove("active"));
+  track.previousSibling.classList.add("active");
+  marquee = {
+    x0: e.clientX, y0: e.clientY, moved: false, track,
+    base: e.ctrlKey || e.metaKey ? new Set(state.selection) : new Set(),
+    el: null,
+  };
+}
+
+function updateMarquee(e) {
+  const m = marquee;
+  if (!m.moved && Math.hypot(e.clientX - m.x0, e.clientY - m.y0) < 4) return;
+  if (!m.moved) {
+    m.moved = true;
+    m.el = document.createElement("div");
+    m.el.className = "tl-marquee";
+    tlContent().appendChild(m.el);
+  }
+  const box = tlContent().getBoundingClientRect();
+  const l = Math.min(m.x0, e.clientX), r = Math.max(m.x0, e.clientX);
+  const t = Math.min(m.y0, e.clientY), b = Math.max(m.y0, e.clientY);
+  Object.assign(m.el.style, { left: l - box.left + "px", top: t - box.top + "px", width: r - l + "px", height: b - t + "px" });
+  const sel = new Set(m.base);
+  document.querySelectorAll(".tl-block").forEach((el) => {
+    const rb = el.getBoundingClientRect();
+    if (rb.right > l && rb.left < r && rb.bottom > t && rb.top < b) sel.add(+el.dataset.id);
+  });
+  setSelection(sel, state.lastSelectedId);
+}
+
+function endMarquee(e) {
+  const m = marquee;
+  marquee = null;
+  if (m.el) m.el.remove();
+  if (!m.moved) {
+    if (!(e.ctrlKey || e.metaKey)) clearSelection();
+    const rect = m.track.getBoundingClientRect();
+    const dur = video().duration;
+    video().currentTime = clamp((e.clientX - rect.left) / state.pps, 0, isFinite(dur) ? dur : Infinity);
+    placePlayhead();
+  }
+}
+
 // -- dragging captions on the timeline --
+// Plain drag slides in time (and can change timeline); holding Shift locks the time so it only moves
+// between timelines. Shift-click without dragging extends the selection.
 
 let tlDrag = null;
 const DRAG_THRESHOLD_PX = 3;
@@ -1078,24 +1345,25 @@ function onBlockMouseDown(e, id) {
   const edge = e.target.classList.contains("tl-hl") ? "l" : e.target.classList.contains("tl-hr") ? "r" : null;
 
   let collapseOnClick = false;
+  let shiftClick = false;
   if (e.ctrlKey || e.metaKey) {
     const next = new Set(state.selection);
     if (next.has(id)) next.delete(id); else next.add(id);
     setSelection(next, id);
-  } else if (e.shiftKey && state.lastSelectedId !== null && idxById(state.lastSelectedId) >= 0) {
-    const [lo, hi] = [idxById(state.lastSelectedId), idxById(id)].sort((a, b) => a - b);
-    setSelection(state.cards.slice(lo, hi + 1).map((c) => c._id), id);
+  } else if (e.shiftKey && !edge) {
+    shiftClick = true; // decided on mouseup: no drag = extend selection, drag = move between timelines
+    if (!state.selection.has(id)) setSelection([...state.selection, id], state.lastSelectedId ?? id);
   } else if (!state.selection.has(id)) {
     setSelection([id], id);
   } else {
-    collapseOnClick = state.selection.size > 1 && !edge; // click (no drag) on a group member picks just it
+    collapseOnClick = state.selection.size > 1 && !edge;
     state.lastSelectedId = id;
   }
   state.activeLane = laneOf(card);
 
   const movers = edge ? [card] : [...state.selection].map(cardById).filter(Boolean);
   tlDrag = {
-    id, edge, collapseOnClick, moved: false,
+    id, edge, collapseOnClick, shiftClick, moved: false,
     startX: e.clientX, grabLane: laneOf(card),
     orig: new Map(movers.map((c) => [c._id, { start: c.start, end: c.end, lane: laneOf(c) }])),
   };
@@ -1103,12 +1371,13 @@ function onBlockMouseDown(e, id) {
 
 document.addEventListener("mousemove", (e) => {
   if (scrubbing) { scrubTo(e.clientX); return; }
+  if (marquee) { updateMarquee(e); return; }
   if (!tlDrag) return;
   const dx = e.clientX - tlDrag.startX;
   if (!tlDrag.moved && Math.abs(dx) < DRAG_THRESHOLD_PX && laneAtY(e.clientY) === tlDrag.grabLane) return;
   tlDrag.moved = true;
 
-  let dt = dx / state.pps;
+  let dt = e.shiftKey && !tlDrag.edge ? 0 : dx / state.pps; // Shift: timeline change only, time stays put
   if (!e.altKey) dt = Math.round(dt * FPS) / FPS; // snap to frames; Alt = free
   const ids = [...tlDrag.orig.keys()];
   const origs = [...tlDrag.orig.values()];
@@ -1129,14 +1398,14 @@ document.addEventListener("mousemove", (e) => {
   const t = Math.max(dt, -Math.min(...origs.map((o) => o.start)));
   const dl = clamp(laneAtY(e.clientY) - tlDrag.grabLane,
     -Math.min(...origs.map((o) => o.lane)),
-    state.laneCount - 1 - Math.max(...origs.map((o) => o.lane)));
+    laneCount() - 1 - Math.max(...origs.map((o) => o.lane)));
   ids.forEach((id) => {
     const c = cardById(id), o = tlDrag.orig.get(id);
     c.start = o.start + t;
     c.end = o.end + t;
     const lane = o.lane + dl;
-    if (lane) c.lane = lane; else delete c.lane;
-    let b = $(`.tl-block[data-id="${id}"]`);
+    setLane(c, lane);
+    const b = $(`.tl-block[data-id="${id}"]`);
     positionBlock(b, c);
     const track = document.querySelector(`.tl-lane-track[data-lane="${lane}"]`);
     if (track && b.parentElement !== track) track.appendChild(b);
@@ -1148,18 +1417,23 @@ document.addEventListener("mousemove", (e) => {
   });
 });
 
-document.addEventListener("mouseup", () => {
+document.addEventListener("mouseup", (e) => {
   scrubbing = null;
+  if (marquee) { endMarquee(e); return; }
   if (!tlDrag) return;
   const d = tlDrag;
   tlDrag = null;
   if (!d.moved) {
-    if (d.collapseOnClick) setSelection([d.id], d.id);
+    if (d.shiftClick && state.lastSelectedId !== null && idxById(state.lastSelectedId) >= 0) {
+      const [lo, hi] = [idxById(state.lastSelectedId), idxById(d.id)].sort((a, b) => a - b);
+      setSelection(state.cards.slice(lo, hi + 1).map((c) => c._id), d.id);
+    } else if (d.collapseOnClick) {
+      setSelection([d.id], d.id);
+    }
     const c = cardById(d.id);
     if (c) { video().currentTime = c.start; placePlayhead(); } // a plain click also cues the video there
     return;
   }
-  // Commit the drag as a single undo step, from the positions before it began.
   const changed = [];
   const prevItems = [];
   const nextItems = [];
@@ -1172,83 +1446,102 @@ document.addEventListener("mouseup", () => {
     }
   });
   if (!changed.length) return;
-  pushUndo({
-    undo: () => applyItemSnapshots(prevItems),
-    redo: () => applyItemSnapshots(nextItems),
-  });
+  pushUndo({ undo: () => applyItemSnapshots(prevItems), redo: () => applyItemSnapshots(nextItems) });
   markDirty();
   afterTimingChange(changed);
 });
 
-// -- zoom / lanes --
+// -- zoom (always centred on the playhead) --
+
+const ppsToSlider = (pps) => Math.round(1000 * Math.log(pps / PPS_MIN) / Math.log(PPS_MAX / PPS_MIN));
+const sliderToPps = (v) => PPS_MIN * Math.pow(PPS_MAX / PPS_MIN, v / 1000);
 
 function setZoom(pps) {
-  state.pps = clamp(pps, 15, 600);
+  const scroll = tlScroll();
+  const t = video().currentTime;
+  const view = scroll.clientWidth - LABEL_W;
+  let offset = t * state.pps - scroll.scrollLeft; // where the playhead sits on screen
+  if (offset < 0 || offset > view) offset = view / 2; // off screen: bring it to the middle
+  state.pps = clamp(pps, PPS_MIN, PPS_MAX);
+  $("#tlZoom").value = ppsToSlider(state.pps);
   renderTimeline();
+  progScroll(scroll, "scrollLeft", Math.max(0, t * state.pps - offset));
+  drawWaveform();
 }
+
 $("#tlZoomIn").addEventListener("click", () => setZoom(state.pps * 1.35));
 $("#tlZoomOut").addEventListener("click", () => setZoom(state.pps / 1.35));
+$("#tlZoom").addEventListener("input", (e) => setZoom(sliderToPps(+e.target.value)));
+$("#tlZoom").value = ppsToSlider(state.pps);
 $("#tlScroll").addEventListener("wheel", (e) => {
   if (!e.ctrlKey) return;
   e.preventDefault();
   setZoom(state.pps * (e.deltaY < 0 ? 1.2 : 1 / 1.2));
 }, { passive: false });
+window.addEventListener("resize", () => drawWaveform());
 
-$("#addLaneBtn").addEventListener("click", () => {
-  state.laneCount += 1;
-  state.activeLane = state.laneCount - 1;
-  pushUndo({
-    undo: () => {
-      state.laneCount = Math.max(1, state.laneCount - 1);
-      state.activeLane = Math.min(state.activeLane, state.laneCount - 1);
-      renderWords(); renderTimeline();
-    },
-    redo: () => {
-      state.laneCount += 1;
-      state.activeLane = state.laneCount - 1;
-      renderWords(); renderTimeline();
-    },
-  });
-  renderWords();
-  renderTimeline();
-});
+// -- show / hide / add timelines --
 
-function removeLastLane() {
-  if (state.laneCount <= 1) return;
-  const lane = state.laneCount - 1;
-  const inLane = state.cards.filter((c) => laneOf(c) === lane);
-  if (inLane.length && !confirm(
-    `Timeline ${lane + 1} has ${inLane.length} caption${inLane.length > 1 ? "s" : ""}. ` +
-    `Move ${inLane.length > 1 ? "them" : "it"} to Timeline ${lane} and remove this timeline?`)) return;
-  const items = inLane.map((c) => ({ id: c._id, lane }));
-  inLane.forEach((c) => { if (lane - 1) c.lane = lane - 1; else delete c.lane; });
-  state.laneCount -= 1;
-  state.activeLane = Math.min(state.activeLane, state.laneCount - 1);
-  pushUndo({
-    undo: () => {
-      state.laneCount += 1;
-      items.forEach((it) => { const c = cardById(it.id); if (c) { if (it.lane) c.lane = it.lane; else delete c.lane; } });
-      sortCards(); renderWords(); renderTimeline();
-    },
-    redo: () => {
-      items.forEach((it) => { const c = cardById(it.id); if (c) { if (lane - 1) c.lane = lane - 1; else delete c.lane; } });
-      state.laneCount = lane;
-      state.activeLane = Math.min(state.activeLane, state.laneCount - 1);
-      sortCards(); renderWords(); renderTimeline();
-    },
+function renderLanesMenu() {
+  const menu = $("#lanesMenu");
+  const items = [];
+  state.lanes.forEach((l, i) => {
+    const n = state.cards.filter((c) => laneOf(c) === i).length;
+    const canHide = n === 0 && laneCount() > 1;
+    items.push(`<div class="menu-item${canHide ? "" : " disabled"}" data-hide="${i}" title="${canHide ? "Hide this timeline" : n ? "Has captions - move them off to hide it" : "The last timeline can't be hidden"}">
+      <span class="check">✓</span><span class="dot" style="background:${laneColor(l)}"></span>${esc(l.name)}<span class="meta">${n}</span></div>`);
   });
-  if (inLane.length) markDirty();
-  sortCards();
-  renderWords();
-  renderTimeline();
+  state.speakers.filter((s) => !state.lanes.some((l) => l.speaker === s.name)).forEach((s) => {
+    items.push(`<div class="menu-item" data-show="${esc(s.name)}" title="Show ${esc(s.name)}'s timeline">
+      <span class="check"></span><span class="dot" style="background:${s.color}"></span>${esc(s.name)}<span class="meta">hidden</span></div>`);
+  });
+  items.push(`<div class="menu-sep"></div><div class="menu-item" data-add="1"><span class="check">+</span>Add new timeline</div>`);
+  menu.innerHTML = items.join("");
+  menu.querySelectorAll("[data-hide]").forEach((el) => el.addEventListener("click", () => {
+    if (!el.classList.contains("disabled")) hideLane(+el.dataset.hide);
+  }));
+  menu.querySelectorAll("[data-show]").forEach((el) => el.addEventListener("click", () => {
+    const before = snapshotLayout();
+    state.lanes.push({ name: el.dataset.show, speaker: el.dataset.show });
+    pushLayoutUndo(before);
+    afterLanesChange();
+  }));
+  menu.querySelector("[data-add]").addEventListener("click", () => {
+    const name = (prompt("Name for the new timeline:", `Timeline ${laneCount() + 1}`) || "").trim();
+    if (!name) return;
+    const before = snapshotLayout();
+    state.lanes.push({ name, speaker: null });
+    pushLayoutUndo(before);
+    afterLanesChange();
+  });
 }
 
+function hideLane(i) {
+  const before = snapshotLayout();
+  state.lanes.splice(i, 1);
+  state.cards.forEach((c) => { if (laneOf(c) > i) setLane(c, laneOf(c) - 1); });
+  state.activeLane = Math.min(state.activeLane, laneCount() - 1);
+  pushLayoutUndo(before);
+  afterLanesChange();
+}
+
+function afterLanesChange() {
+  markDirty();
+  renderWords();
+  renderTimeline();
+  renderLanesMenu();
+}
+
+$("#lanesBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const menu = $("#lanesMenu");
+  menu.classList.toggle("hidden");
+  if (!menu.classList.contains("hidden")) renderLanesMenu();
+});
+
 // ---------- undo / redo ----------
-// Every mutating action pushes {undo(), redo(), ...} — both closures replay
-// exactly what the original edit did, so there's one code path per action
-// instead of separate forward/reverse interpreters. History is capped at
-// MAX_HISTORY steps each way; making any new edit clears the redo branch,
-// same as every other undo/redo implementation.
+// Every mutating action pushes {undo(), redo()} - both closures replay exactly what the edit did. History
+// is capped at MAX_HISTORY steps each way; a new edit clears the redo branch.
 
 function pushUndo(action) {
   state.undoStack.push(action);
@@ -1278,22 +1571,19 @@ function redoLast() {
 }
 
 function updateHistoryButtons() {
-  const undoBtn = $("#undoBtn");
-  const redoBtn = $("#redoBtn");
-  if (undoBtn) undoBtn.disabled = state.undoStack.length === 0;
-  if (redoBtn) redoBtn.disabled = state.redoStack.length === 0;
+  $("#undoBtn").disabled = state.undoStack.length === 0;
+  $("#redoBtn").disabled = state.redoStack.length === 0;
 }
 
 $("#undoBtn").addEventListener("click", undoLast);
 $("#redoBtn").addEventListener("click", redoLast);
 updateHistoryButtons();
 
-// ---------- current-word lookup & tagging ----------
+// ---------- current caption lookup & tagging ----------
 
 const REACTION_LEEWAY = 0.35; // seconds of tolerance for a slightly-late keypress
 
-// The caption a "tag the current word" keypress means: the most recently
-// started one (any timeline). Ties go to the lowest timeline.
+// The caption a "tag the current word" keypress means: the most recently started one (any timeline).
 function currentCardIndex(t) {
   let best = -1;
   for (let i = 0; i < state.cards.length; i++) {
@@ -1313,49 +1603,28 @@ function currentCardInLane(t, lane) {
   return best;
 }
 
+// Tag captions with a speaker and move them onto that speaker's timeline (unhiding it on first use).
 function assignSpeaker(name) {
-  if (state.selection.size > 0) {
-    const items = [];
-    for (const id of state.selection) {
-      const card = cardById(id);
-      if (!card || card.speaker === name) continue;
-      items.push({ id, prev: card.speaker });
-      card.speaker = name;
-    }
-    if (items.length > 0) {
-      pushUndo({
-        undo: () => items.forEach((it) => { const c = cardById(it.id); if (c) { c.speaker = it.prev; refreshRow(c); } }),
-        redo: () => items.forEach((it) => { const c = cardById(it.id); if (c) { c.speaker = name; refreshRow(c); } }),
-      });
-      markDirty();
-      items.forEach((item) => refreshRow(cardById(item.id)));
-    }
-    // Tagging always closes out the selection — next hotkey starts fresh
-    // instead of silently piling onto whatever was selected before.
-    clearSelection();
-    return;
+  const targets = state.selection.size > 0
+    ? [...state.selection].map(cardById).filter(Boolean)
+    : (() => { const i = currentCardIndex(video().currentTime); return i < 0 ? [] : [state.cards[i]]; })();
+  const todo = targets.filter((c) => c.speaker !== name || state.lanes[laneOf(c)]?.speaker !== name);
+  if (todo.length) {
+    const before = snapshotLayout();
+    const lane = laneForSpeaker(name);
+    todo.forEach((c) => { c.speaker = name; setLane(c, lane); });
+    pushLayoutUndo(before);
+    markDirty();
+    sortCards();
+    renderWords();
+    renderTimeline();
+    todo.forEach((c) => refreshRow(c));
   }
-
-  const idx = currentCardIndex(video().currentTime);
-  if (idx < 0) return;
-  const card = state.cards[idx];
-  if (card.speaker === name) return;
-  const prev = card.speaker;
-  const id = card._id;
-  card.speaker = name;
-  pushUndo({
-    undo: () => { const c = cardById(id); if (c) { c.speaker = prev; refreshRow(c); } },
-    redo: () => { const c = cardById(id); if (c) { c.speaker = name; refreshRow(c); } },
-  });
-  markDirty();
-  refreshRow(card);
-  if (state.followVideo) {
-    const row = rowOf(card._id);
-    if (row) row.scrollIntoView({ block: "nearest" });
-  }
+  if (state.selection.size > 0) clearSelection(); // tagging closes out a selection
+  else if (todo.length && state.followVideo) scrollRowIntoList(todo[0]._id);
 }
 
-// ---------- playback ----------
+// ---------- keys ----------
 
 function isTypingTarget(el) {
   if (!el) return false;
@@ -1363,44 +1632,27 @@ function isTypingTarget(el) {
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
 }
 
+const openModal = () => [...document.querySelectorAll(".modal")].find((m) => !m.classList.contains("hidden"));
+
 document.addEventListener("keydown", (e) => {
   if ($("#editor").classList.contains("hidden")) return;
-  if (isTypingTarget(document.activeElement)) return;
-  if (!$("#speakerModal").classList.contains("hidden")) return;
+  const modal = openModal();
+  if (e.key === "Escape" && modal && modal.id !== "speakerModal") { modal.classList.add("hidden"); blurFocused(); return; }
+  if (isTypingTarget(document.activeElement) || modal) return;
 
   const v = video();
-  if (e.key === " ") {
-    e.preventDefault();
-    v.paused ? v.play() : v.pause();
-    return;
-  }
-  if (e.key === "<" || e.key === ",") {
-    e.preventDefault();
-    v.currentTime = Math.max(0, v.currentTime - 5);
-    return;
-  }
-  if (e.key === ">" || e.key === ".") {
-    e.preventDefault();
-    v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 5);
-    return;
-  }
-  if (e.key === "Enter") {
-    e.preventDefault();
-    v.currentTime = 0;
-    return;
-  }
-  if (e.key === "Backspace") {
-    e.preventDefault();
-    if (e.shiftKey) redoLast(); else undoLast();
-    return;
-  }
+  if (e.key === " ") { e.preventDefault(); v.paused ? v.play() : v.pause(); return; }
+  if (e.key === "<" || e.key === ",") { e.preventDefault(); v.currentTime = Math.max(0, v.currentTime - 5); return; }
+  if (e.key === ">" || e.key === ".") { e.preventDefault(); v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 5); return; }
+  if (e.key === "Enter") { e.preventDefault(); v.currentTime = 0; return; }
+  if (e.key === "Backspace") { e.preventDefault(); if (e.shiftKey) redoLast(); else undoLast(); return; }
+  if (e.key === "Delete") { e.preventDefault(); deleteCards([...state.selection]); return; }
   if (e.key === "Escape") {
     e.preventDefault();
     clearSelection();
+    $("#lanesMenu").classList.add("hidden");
     return;
   }
-  // Arrow keys bump the selected captions: ←/→ one frame (Shift = 10 frames),
-  // ↑/↓ one timeline up/down.
   if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
     if (state.selection.size) {
       e.preventDefault();
@@ -1410,43 +1662,36 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (e.key === "ArrowUp" || e.key === "ArrowDown") {
-    if (state.selection.size) {
-      e.preventDefault();
-      nudgeSelection(0, e.key === "ArrowUp" ? -1 : 1);
-    }
+    if (state.selection.size) { e.preventDefault(); nudgeSelection(0, e.key === "ArrowUp" ? -1 : 1); }
     return;
   }
-  const key = e.key.toLowerCase();
-  const sp = state.speakers.find((s) => s.key === key);
-  if (sp) {
+  const sp = state.speakers.find((s) => s.key === e.key.toLowerCase());
+  if (sp && !e.ctrlKey && !e.altKey && !e.metaKey) {
     e.preventDefault();
     assignSpeaker(sp.name);
   }
 });
 
-// The live preview mirrors the renderer: timeline 1 is the big main caption,
-// further timelines stack smaller underneath it.
-function renderOverlayLanes() {
-  const overlay = $("#overlay");
-  overlay.innerHTML = "";
-  for (let i = 0; i < state.laneCount; i++) {
-    const d = document.createElement("div");
-    d.className = "ov-line" + (i > 0 ? " ov-sub" : "");
-    d.dataset.lane = i;
-    overlay.appendChild(d);
-  }
-}
+// ---------- live preview ----------
+// Mirrors the renderer: whichever timeline is showing a caption highest up draws big on the seam, any
+// others showing at the same moment stack smaller underneath.
 
 function updateOverlay() {
   const t = video().currentTime;
-  document.querySelectorAll("#overlay .ov-line").forEach((d) => {
-    const lane = parseInt(d.dataset.lane, 10);
+  const overlay = $("#overlay");
+  const active = [];
+  for (let lane = 0; lane < laneCount(); lane++) {
     const card = currentCardInLane(t, lane);
-    if (!card || t > card.end + 0.4) { d.textContent = ""; return; }
-    d.textContent = card.lines.join("\n").toUpperCase();
-    const sp = card.speaker ? speakerByName(card.speaker) : null;
-    d.style.color = sp ? sp.color : "#ffffff";
-  });
+    if (card && t <= card.end + 0.4 && card.lines.join("").trim()) active.push(card);
+  }
+  const key = active.map((c) => c._id + ":" + c.lines.join("|") + ":" + c.speaker).join(",");
+  if (overlay.dataset.key !== key) {
+    overlay.dataset.key = key;
+    overlay.innerHTML = active.map((c, i) => {
+      const sp = c.speaker ? speakerByName(c.speaker) : null;
+      return `<div class="ov-line${i ? " ov-sub" : ""}" style="color:${sp ? sp.color : "#fff"}">${esc(c.lines.join("\n").toUpperCase())}</div>`;
+    }).join("");
+  }
 
   const idx = currentCardIndex(t);
   document.querySelectorAll(".word-row.current").forEach((r) => r.classList.remove("current"));
@@ -1454,31 +1699,27 @@ function updateOverlay() {
   const row = rowOf(state.cards[idx]._id);
   if (row) {
     row.classList.add("current");
-    // Still marked so you can find the live word by eye while browsing,
-    // just doesn't yank the list to it unless following is turned on.
-    if (state.followVideo) row.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (state.followVideo && !video().paused) scrollRowIntoList(state.cards[idx]._id);
   }
 }
 
 function followTimeline() {
-  if (!state.followVideo || tlDrag || scrubbing) return;
+  if (!state.followVideo || tlDrag || scrubbing || marquee) return;
   const scroll = tlScroll();
   const x = video().currentTime * state.pps;
   const view = scroll.clientWidth - LABEL_W;
   if (x < scroll.scrollLeft + 10 || x > scroll.scrollLeft + view - 40) {
-    scroll.scrollLeft = Math.max(0, x - view * 0.25);
+    progScroll(scroll, "scrollLeft", Math.max(0, x - view * 0.25));
   }
 }
 
 function tick() {
   const v = video();
-  if (v.duration) {
+  if (v.duration && !$("#editor").classList.contains("hidden")) {
     updateOverlay();
     placePlayhead();
     followTimeline();
-    if (!state.dragging) {
-      $("#seekBar").value = Math.round((v.currentTime / v.duration) * 1000);
-    }
+    if (!state.dragging) $("#seekBar").value = Math.round((v.currentTime / v.duration) * 1000);
     $("#timeLabel").textContent = `${fmtTime(v.currentTime)} / ${fmtTime(v.duration)}`;
   }
   requestAnimationFrame(tick);
@@ -1496,25 +1737,11 @@ $("#seekBar").addEventListener("change", () => { state.dragging = false; });
 
 $("#saveBtn").addEventListener("click", async () => {
   const strayStar = state.cards.filter((c) => c.lines.some((l) => l.includes("*"))).length;
-  if (strayStar > 0) {
-    const proceed = confirm(
-      `${strayStar} caption${strayStar > 1 ? "s contain" : " contains"} a lone * that isn't closed — ` +
-      `it would show up in the video. Close it as *note* or remove it. Save anyway?`
-    );
-    if (!proceed) return;
-  }
-  // A card with no text but a production note is a supported "silent"
-  // note-only card (drives an image overlay / fx / position change with
-  // nothing drawn on screen) — only a card with neither text nor a note is
-  // actually pointless and worth warning about.
+  if (strayStar > 0 && !confirm(`${strayStar} caption${strayStar > 1 ? "s contain" : " contains"} a lone * that would show in the video. Save anyway?`)) return;
+  // A card with no text but a production note is a supported "silent" note-only card; only a card with
+  // neither is pointless.
   const emptyCount = state.cards.filter((c) => !c.lines.join("").trim() && !c.note).length;
-  if (emptyCount > 0) {
-    const proceed = confirm(
-      `${emptyCount} caption${emptyCount > 1 ? "s have" : " has"} neither text nor a production note — ` +
-      `it won't do anything. Save anyway? (Cancel to go back and fill it in or delete it.)`
-    );
-    if (!proceed) return;
-  }
+  if (emptyCount > 0 && !confirm(`${emptyCount} caption${emptyCount > 1 ? "s have" : " has"} neither text nor a production note, so it won't do anything. Save anyway?`)) return;
   if (!state.speakersHandle) {
     try {
       state.speakersHandle = await window.showSaveFilePicker({
@@ -1522,20 +1749,20 @@ $("#saveBtn").addEventListener("click", async () => {
         types: JSON_TYPES,
       });
     } catch (e) {
-      if (e.name === "AbortError") return; // user cancelled, don't lose their edits
-      alert("Couldn't create speakers.json: " + e.message);
+      if (e.name === "AbortError") return; // cancelled - keep the edits
+      alert("Couldn't create the speakers file: " + e.message);
       return;
     }
   }
   if (!(await ensureReadWrite(state.speakersHandle))) {
-    alert("Write permission for speakers.json was denied.");
+    alert("Write permission for the speakers file was denied.");
     return;
   }
 
   sortCards();
   const bakedCards = state.cards.map((c) => {
-    // Carry through any field the editor doesn't manage (fx, emphasis_scale,
-    // ...) so saving never silently strips data another tool put on a card.
+    // Carry through any field the editor doesn't manage (fx, emphasis_scale, ...) so saving never strips
+    // data another tool put on a card.
     const { _id, speaker: _s, fill: _f, note: _n, lane: _l, ...passthrough } = c;
     const out = { ...passthrough, start: c.start, end: c.end, lines: c.lines };
     if (laneOf(c)) out.lane = laneOf(c);
@@ -1546,31 +1773,32 @@ $("#saveBtn").addEventListener("click", async () => {
       if (sp) out.fill = hexToRgba(sp.color);
       else if (c.fill) out.fill = c.fill;
     } else if (c.fill) {
-      out.fill = c.fill; // leave untouched if never retagged
+      out.fill = c.fill;
     }
     return out;
   });
+  const sidecar = { font: state.font, speakers: state.speakers, lanes: state.lanes };
+  if (state.fontFile) sidecar.font_file = state.fontFile;
 
   try {
     const cardsWritable = await state.cardsHandle.createWritable();
     await cardsWritable.write(JSON.stringify(bakedCards, null, 2));
     await cardsWritable.close();
-
     const spWritable = await state.speakersHandle.createWritable();
-    await spWritable.write(JSON.stringify({ font: state.font, speakers: state.speakers }, null, 2));
+    await spWritable.write(JSON.stringify(sidecar, null, 2));
     await spWritable.close();
   } catch (e) {
     alert("Save failed: " + e.message);
     return;
   }
 
+  saveSettingsSoon();
   markDirty(false);
   $("#speakersPathLabel").textContent = state.speakersHandle.name;
   $("#speakersPathLabel").classList.add("chosen");
   const btn = $("#saveBtn");
-  const original = btn.textContent;
   btn.textContent = "Saved ✓";
-  setTimeout(() => { btn.textContent = original; }, 1200);
+  setTimeout(() => { btn.textContent = "Save"; }, 1200);
 });
 
 window.addEventListener("beforeunload", (e) => {
