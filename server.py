@@ -154,6 +154,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
     args = ap.parse_args()
+    # Windows' SO_REUSEADDR lets a second server bind the same port and silently lose every request to the
+    # first one; fail loudly instead.
+    ThreadingHTTPServer.allow_reuse_address = False
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"Cabtions running at http://127.0.0.1:{args.port}")
     try:

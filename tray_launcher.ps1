@@ -33,9 +33,24 @@ function Find-AppBrowser {
 }
 
 function Open-AppWindow {
+    # Only one editor window: bring an open Cabtions window forward instead of opening another.
+    $open = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq "Cabtions" } | Select-Object -First 1
+    if ($open) { (New-Object -ComObject WScript.Shell).AppActivate($open.Id) | Out-Null; return }
     $browser = Find-AppBrowser
     if ($browser) { Start-Process $browser -ArgumentList "--app=$url", "--window-size=1600,1000" }
     else { Start-Process $url }
+}
+
+# Stop every leftover copy of this repo's server and tray (older launchers had no single-instance guard, and
+# several servers could end up sharing the port, with requests going to the oldest), so ours starts clean.
+function Stop-OldServer {
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*tray_launcher*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+        Where-Object { $_.CommandLine -like "*$serverScript*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 400
 }
 
 function Start-CaptionServer {
@@ -57,6 +72,15 @@ function Wait-ForServer {
     return $false
 }
 
+# One Cabtions at a time: a second launch just opens (or focuses) the editor window and exits.
+$createdNew = $false
+$script:mutex = New-Object System.Threading.Mutex($true, "Local\CabtionsTray", [ref]$createdNew)
+if (-not $createdNew) {
+    Open-AppWindow
+    exit
+}
+
+Stop-OldServer
 $script:serverProc = Start-CaptionServer
 
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
