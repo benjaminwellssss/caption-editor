@@ -38,9 +38,9 @@ files needs their File System Access API.
 
 1. **Get a clip folder.** The video-editor pipeline writes one per short in the deliverables folder,
    `CLIPS/<MM-DD-YYYY_GAME>/<clip>/`, with `<clip>.mp4` and `captions.json` (one word per card).
-2. **Open** the video, its `captions.json` and, optionally, a speakers file (names, keys, colours, font
-   and timelines). If you skip it, Cabtions uses the roster you had last time and makes the file on
-   first save.
+2. **Open** the video, its `captions.json` and, optionally, a speakers file. Set **Start in** once to your
+   clips folder and every file dialog opens there (browsers can't take a typed path, so you pick it once;  it's remembered). If you skip the speakers file, Cabtions uses the roster you had last time and makes
+   the file on first save.
 3. **Fix whatever needs it**, in any order (how-tos below).
 4. **Save.** It writes straight back to the files you opened.
 5. **Render.** Ask Claude (in the video-editor repo) to render the captions. Saved cards are drawn
@@ -58,13 +58,18 @@ Every key and mouse action is also listed in the editor: click **?** in the top-
 Press a **speaker key** to tag the current caption, or a whole selection at once. Defaults: B Ben,
 J Jared, N Noah, A Brien, M Marlee, K Kat, T Tony, H Mitch.
 
-**Every speaker has their own timeline.** Speakers who haven't been tagged yet are *hidden*. Tag Jared
+**Every speaker has their own timeline.** Timeline 1 is always the first speaker in the roster (Ben) and
+Timeline 2 the second (Jared); anyone else who's tagged follows. Speakers who haven't been tagged yet are
+*hidden*. Tag Jared
 for the first time and his timeline appears, and everything you tag as his moves onto it. When you open
 a fresh caption file that already has speakers, each one is put on their own timeline in roster order,
 so the first speaker in the roster (the streamer) is the top, big-caption timeline.
 
 Edit a speaker's name, key or colour by clicking them in the Speakers panel. The roster is remembered for
 next time (it's saved as you change it, and again when you close the editor).
+
+If captions end up on the wrong timeline, **⇅ Autosort** moves every tagged caption onto its speaker's
+timeline in one step.
 
 ### Show, hide or add timelines
 **Show timelines ▾** lists every timeline with a ✓ and how many captions it holds, then the hidden
@@ -86,6 +91,13 @@ whichever timeline it's on. The live preview matches.
 - **← / →** nudges the selection 1 frame (**Shift** = 10), **↑ / ↓** moves it a timeline up or down, and
   **Delete** deletes it.
 
+### Trim dead air out of the video
+Drag across the **Audio** row to select a stretch, then press **✂ Trim** (or **Delete**). Trimmed
+stretches show hatched red; the preview skips them while playing, and **↺** on one brings it back.
+Captions keep their original times. The trims are saved in the speakers file, and the video-editor
+pipeline cuts them out of the finished video after the captions are composited
+(`scripts/apply_trims.py`), so picture, sound and captions stay in sync.
+
 ### Line words up with the audio
 The **Audio** row under the ruler is the clip's own waveform, on the same time scale as the captions.
 Spikes show sibilance, plosives and laughs, so you can see where a word starts.
@@ -98,19 +110,31 @@ scrolls inside its own panel, so following never moves the whole window.
 
 ### Fix a word, split a line, add an emoji
 Click into the row's text box and type. `|` is a **line break**: `HECK|YES` puts YES under HECK. Use the
-row's 😀 for emoji (or **Win + .**), **+** to add a caption after it, **✕** to delete it, or
+row's 😀 for emoji (or **Win + .**), **GIF** to search GIPHY and drop a GIF link straight into its PROD NOTES, **+** to add a caption after it, **✕** to delete it, or
 **+ Add caption** to add one at the playhead on the active timeline (click a timeline's name to make it
 active).
 
-### Pick the caption font
-The **Font** dropdown sets the font for the whole video. **Fonts…** opens a browser of every installed
-font, each previewed in its own typeface with your own sample text. Click a name to use it; click its
-**★** to add it to the dropdown for every future video. The renderer knows Bebas Neue, Montserrat Black,
+### Pick fonts (for the video, or per speaker)
+The **Font** button opens a browser of every installed font, each previewed in its own typeface with your
+own sample text. Click one to use it for the whole video; **★** pins it to the top of the list for next
+time. Each speaker can also have their **own font**: click them in the Speakers panel and pick one, or
+**Reset** to follow the video's font. The renderer knows Bebas Neue, Montserrat Black,
 Anton, Archivo Black and Poppins ExtraBold by name. Any other font is saved with its file path so the
 renderer can load it directly.
 
 To list fonts from a folder that isn't installed, add it to `settings.json` next to `server.py`:
 `{"font_dirs": ["<your-fonts-folder>"]}`.
+
+### "Who's talking" overlay
+The **Voice overlay** switch (on by default) adds a small avatar and name for each speaker in the video,
+bottom-left of the facecam; whoever has a caption on screen lights up in their colour. The preview shows
+it, and the renderer draws it.
+
+### GIF search
+**GIF** on a caption row searches GIPHY (it starts with the caption's own words) and clicking a result adds
+its link to that caption's PROD NOTES. It needs a free GIPHY API key from developers.giphy.com, saved as
+`"giphy_key"` in `settings.json` next to `server.py`. That file stays on your machine and is never
+committed.
 
 ### Add an effect, a colour, or an image
 Write it in plain English in the row's amber **PROD NOTES** field. Notes are **never shown** in the
@@ -128,7 +152,8 @@ video. The renderer understands:
 | `red`, `green`, `blue`, `yellow`, `orange`, `purple`, `pink`, `white`, `black`, `cyan` | overrides that card's text colour |
 | `gentle` / `very` / `extremely` / `violent` / `max` | intensity: ×0.5 / ×1.3 / ×1.5 / ×2 / ×3 |
 | `progressively more …` | ramps the effect across this and the following cards (or inside one card) |
-| an image or GIF link | shows it for that card's duration. Position words: `top left`, `dead center`, `bottom right`, …, or `above`/`below` the caption. `until the end` keeps it up to the end of the video. |
+| an image or GIF link | shows it for that card's duration, in the gameplay area just under the facecam: scaled to a fixed height (wider is fine) and centre-cropped if it's too wide. Captions always draw on top. Position words move it: `top left`, `dead center`, `bottom right`, …, or `above`/`below` the caption. `until the end` keeps it up to the end of the video. |
+| the same link on a start caption and an end caption | shows it the whole way from the first to the second |
 | `start … <link>` … a later card's `stop` | keeps the image up from the first card until the stop card |
 | `start this image at "word"` | starts the image on an earlier card with that word |
 | a Google Fonts link + `for all of "name" text` | that font (and the note's last colour) for every card of that speaker |
@@ -160,8 +185,11 @@ window. Undo and redo keep the last 10 steps.
 - Files from older versions with `*note*` typed into the caption text are converted on open.
 
 The speakers file (`<captions>_speakers.json`) holds
-`{"font", "font_file"?, "speakers": [{name, key, color}], "lanes": [{name, speaker}]}`. A plain speakers
+`{"font", "font_file"?, "speakers": [{name, key, color, font?, font_file?}], "lanes": [{name, speaker}],
+"voice_overlay", "trims"?: [[start, end], ...]}`. A plain speakers
 array from an older version still opens.
 
-`settings.json` next to `server.py` keeps the speaker roster and favourite fonts between sessions. It's
-local to your machine and not tracked by git.
+`settings.json` next to `server.py` keeps the speaker roster, pinned fonts and your GIPHY key between
+sessions. It's local to your machine and not tracked by git.
+
+Only one Cabtions runs at a time: opening it again brings the existing window to the front.

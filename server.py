@@ -9,6 +9,8 @@ This server hands the browser the app's static files, plus three small helpers:
   GET /fonts           installed fonts (Windows system + per-user font folders, plus any folders listed in
                        settings.json "font_dirs") as [{family, style, file}]
   GET /fontfile?i=N    the Nth font file from /fonts, so the picker can preview it
+  POST /avatar?name=X  saves an uploaded profile picture as avatars/X.png (square, 256 px), returns its path
+  GET /avatars/X.png   serves one, for the editor's preview
 
 Usage: <python> server.py [--port 8765]
 Then open http://127.0.0.1:8765 in Chrome or Edge (Firefox/Safari don't support the File System Access API).
@@ -22,10 +24,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 STATIC_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_FILES = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css"}
+STATIC_FILES = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css",
+                "/manifest.webmanifest": "manifest.webmanifest"}
 ASSET_DIR = os.path.join(STATIC_DIR, "assets")
 SETTINGS = os.path.join(STATIC_DIR, "settings.json")
+AVATAR_DIR = os.path.join(STATIC_DIR, "avatars")  # speaker profile pictures for the voice overlay (git-ignored)
 FONT_EXT = (".ttf", ".otf", ".ttc")
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 
 def font_names(path):
@@ -73,7 +78,7 @@ _fonts = None
 def list_fonts():
     global _fonts
     if _fonts is None:
-        dirs = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+        dirs = [os.path.join(os.environ.get("WINDIR", ""), "Fonts"),
                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts")]
         dirs += load_settings().get("font_dirs", [])
         seen, out = set(), []
@@ -121,6 +126,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_error(404)
             with open(path, "rb") as f:
                 return self.send_bytes(f.read(), "font/ttf")
+        if url.path.startswith("/avatars/"):
+            path = os.path.normpath(os.path.join(STATIC_DIR, url.path.lstrip("/")))
+            if not path.startswith(AVATAR_DIR) or not os.path.isfile(path):
+                return self.send_error(404)
+            with open(path, "rb") as f:
+                return self.send_bytes(f.read(), "image/png")
         if url.path.startswith("/assets/"):
             path = os.path.normpath(os.path.join(STATIC_DIR, url.path.lstrip("/")))
             if not path.startswith(ASSET_DIR) or not os.path.isfile(path):  # no escaping the assets folder
@@ -134,7 +145,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(f.read(), mimetypes.guess_type(path)[0] or "application/octet-stream")
 
     def do_POST(self):
-        if urlparse(self.path).path != "/settings":
+        url = urlparse(self.path)
+        if url.path == "/avatar":
+            return self.save_avatar(parse_qs(url.query).get("name", [""])[0])
+        if url.path != "/settings":
             return self.send_error(404)
         try:
             data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
@@ -142,12 +156,49 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("settings must be an object")
         except ValueError as e:
             return self.send_error(400, str(e))
-        merged = {**load_settings(), **data}  # a partial update never wipes other keys
+        old = load_settings()
+        merged = {**old, **data}  # a partial update never wipes other keys (e.g. giphy_key)
+        # an editor window running older code saves its roster without handles/pictures - keep them
+        prev = {sp.get("name"): sp for sp in old.get("speakers", []) if isinstance(sp, dict)}
+        for sp in merged.get("speakers", []):
+            for k in ("handle", "avatar", "font", "font_file"):
+                if k not in sp and k in prev.get(sp.get("name"), {}):
+                    sp[k] = prev[sp["name"]][k]
         tmp = SETTINGS + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(merged, f, indent=2)
         os.replace(tmp, SETTINGS)
         self.send_json({"ok": True})
+
+    def save_avatar(self, name):
+        n = int(self.headers.get("Content-Length", 0))
+        if not 0 < n <= 15_000_000:
+            return self.send_error(400, "picture missing or too big")
+        try:
+            path = save_avatar_bytes(name, self.rfile.read(n))
+        except (ValueError, OSError) as e:
+            return self.send_error(400, str(e))
+        self.send_json({"path": path, "url": "/avatars/" + os.path.basename(path)})
+
+
+def save_avatar_bytes(name, data):
+    """Square-crop and save an uploaded picture as avatars/<name>.png; returns the saved path."""
+    safe = "".join(ch for ch in name if ch.isalnum() or ch in " _-").strip()
+    if not safe:
+        raise ValueError("speaker name needed")
+    os.makedirs(AVATAR_DIR, exist_ok=True)
+    path = os.path.join(AVATAR_DIR, safe + ".png")
+    try:
+        from PIL import Image  # resize when Pillow is available; otherwise keep the file as sent
+        import io
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        side = min(im.size)
+        im = im.crop(((im.width - side) // 2, (im.height - side) // 2, (im.width + side) // 2, (im.height + side) // 2))
+        im.resize((256, 256)).save(path)
+    except ImportError:
+        with open(path, "wb") as f:
+            f.write(data)
+    return path
 
 
 def main():

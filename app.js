@@ -32,6 +32,9 @@ const state = {
   activeLane: 0,           // where "+ Add caption" puts a new caption
   pps: 80,                 // timeline zoom, pixels per second
   peaks: null,             // audio waveform: Float32Array of peak levels, PEAK_RATE per second
+  trims: [],               // [[start, end], ...] stretches cut out of the video at render time (sorted, merged)
+  trimSel: null,           // [start, end] selected on the Audio row, waiting for ✂ Trim
+  voiceOverlay: true,      // draw the "who's talking" overlay in the facecam
 };
 let nextId = 1;
 const PEAK_RATE = 200;
@@ -169,6 +172,36 @@ async function ensureReadWrite(handle) {
 
 // ---------- native file pickers ----------
 
+// The folder every file dialog opens in. Browsers can't be pointed at a typed path, so you pick it once
+// (your clips folder) and the handle is kept in IndexedDB for next time.
+const idb = (mode, fn) => new Promise((resolve) => {
+  const open = indexedDB.open("cabtions", 1);
+  open.onupgradeneeded = () => open.result.createObjectStore("kv");
+  open.onsuccess = () => {
+    const req = fn(open.result.transaction("kv", mode).objectStore("kv"));
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);
+  };
+  open.onerror = () => resolve(null);
+});
+let startDir = null;
+idb("readonly", (st) => st.get("startDir")).then((h) => {
+  startDir = h || null;
+  if (startDir) { $("#startDirLabel").textContent = startDir.name; $("#startDirLabel").classList.add("chosen"); }
+});
+
+$("#startDirBtn").addEventListener("click", async () => {
+  try {
+    const h = await window.showDirectoryPicker({ id: "cabtions-start", startIn: startDir || "videos" });
+    startDir = h;
+    await idb("readwrite", (st) => st.put(h, "startDir"));
+    $("#startDirLabel").textContent = h.name;
+    $("#startDirLabel").classList.add("chosen");
+  } catch (e) {
+    if (e.name !== "AbortError") console.error(e);
+  }
+});
+
 const JSON_TYPES = [{ description: "JSON", accept: { "application/json": [".json"] } }];
 const VIDEO_TYPES = [{ description: "Video", accept: { "video/*": [".mp4", ".mov", ".mkv", ".webm"] } }];
 
@@ -183,7 +216,10 @@ async function pickFile(target) {
   }
   const types = target === "video" ? VIDEO_TYPES : JSON_TYPES;
   try {
-    const [handle] = await window.showOpenFilePicker({ types, multiple: false });
+    // captions and speakers open in the video's own folder once a video is picked; the video starts in the
+    // default folder (passing a file handle as startIn opens the folder that file is in)
+    const startIn = target !== "video" && state.videoHandle ? state.videoHandle : startDir || "videos";
+    const [handle] = await window.showOpenFilePicker({ types, multiple: false, startIn });
     if (target === "video") state.videoHandle = handle;
     else if (target === "cards") state.cardsHandle = handle;
     else state.speakersHandle = handle;
@@ -222,12 +258,13 @@ function pushLayoutUndo(before) {
   pushUndo({ undo: () => restoreLayout(before), redo: () => restoreLayout(after) });
 }
 
-// Lanes from a fresh caption file: one timeline per speaker, in speaker-roster order (so the first speaker
-// in the roster - the streamer - is the top, big-caption timeline), untagged captions on the top timeline.
+// Lanes from a fresh caption file: Timeline 1 and 2 are always the first two roster speakers (Ben, Jared),
+// then every other speaker who's tagged, in roster order. Untagged captions go on Timeline 1.
 function organizeBySpeaker() {
   const present = new Set(state.cards.map((c) => c.speaker).filter(Boolean));
   const rank = (n) => { const i = state.speakers.findIndex((s) => s.name === n); return i < 0 ? 1e6 : i; };
-  const order = [...present].sort((a, b) => rank(a) - rank(b));
+  const order = state.speakers.slice(0, 2).map((s) => s.name);
+  [...present].sort((a, b) => rank(a) - rank(b)).forEach((n) => { if (!order.includes(n)) order.push(n); });
   state.lanes = order.length ? order.map((n) => ({ name: n, speaker: n })) : [{ name: "Main", speaker: null }];
   state.cards.forEach((c) => setLane(c, c.speaker ? order.indexOf(c.speaker) : 0));
 }
@@ -275,6 +312,8 @@ async function loadProject() {
   let font = DEFAULT_FONT;
   let fontFile = null;
   let savedLanes = null;
+  let trims = [];
+  let voiceOverlay = true;
   if (state.speakersHandle) {
     try {
       const parsed = JSON.parse(await (await state.speakersHandle.getFile()).text());
@@ -286,6 +325,8 @@ async function loadProject() {
         if (parsed.font) font = parsed.font;
         if (parsed.font_file) fontFile = parsed.font_file;
         if (Array.isArray(parsed.lanes) && parsed.lanes.length) savedLanes = parsed.lanes;
+        if (Array.isArray(parsed.trims)) trims = parsed.trims.filter((r) => Array.isArray(r) && r[1] > r[0]);
+        if (parsed.voice_overlay === false) voiceOverlay = false;
       }
     } catch (e) {
       errEl.textContent = "Could not read speakers.json: " + e.message;
@@ -318,7 +359,7 @@ async function loadProject() {
     state.lanes = savedLanes.map((l, i) => (typeof l === "string" ? { name: l, speaker: null } : { name: l.name || `Timeline ${i + 1}`, speaker: l.speaker || null }));
   } else if (maxLane === 0) {
     organizeBySpeaker(); // first open of a fresh caption file: put each speaker on their own timeline
-    if (state.cards.some((c) => laneOf(c) > 0)) migrated = true;
+    migrated = true;
   } else {
     state.lanes = [];
   }
@@ -328,8 +369,11 @@ async function loadProject() {
   state.activeLane = 0;
   state.font = font;
   state.fontFile = fontFile;
-  renderFontSelect();
-  applyOverlayFont();
+  state.trims = trims;
+  state.trimSel = null;
+  state.voiceOverlay = voiceOverlay;
+  $("#voiceToggle").checked = voiceOverlay;
+  renderFontButton();
   state.undoStack = [];
   state.redoStack = [];
   state.selection = new Set();
@@ -447,6 +491,11 @@ function openSpeakerModal(idx) {
   $("#spName").value = isNew ? "" : state.speakers[idx].name;
   $("#spKey").value = isNew ? "" : state.speakers[idx].key;
   $("#spColor").value = isNew ? randomColor() : state.speakers[idx].color;
+  pendingSpeakerFont = isNew ? { family: null, file: null } : { family: state.speakers[idx].font || null, file: state.speakers[idx].font_file || null };
+  renderSpeakerFontButton();
+  $("#spHandle").value = isNew ? "" : state.speakers[idx].handle || "";
+  pendingAvatar = isNew ? null : state.speakers[idx].avatar || null;
+  renderSpeakerAvatar();
   $("#spDelete").classList.toggle("hidden", isNew);
   $("#speakerFormError").textContent = "";
   $("#speakerModal").classList.remove("hidden");
@@ -496,11 +545,17 @@ $("#spSave").addEventListener("click", () => {
 
   const speakersBefore = state.speakers.map((s) => ({ ...s }));
   const layoutBefore = snapshotLayout();
+  const sp = { name, key, color };
+  if (pendingSpeakerFont.family) sp.font = pendingSpeakerFont.family;
+  if (pendingSpeakerFont.file) sp.font_file = pendingSpeakerFont.file;
+  const handle = $("#spHandle").value.trim().replace(/^@/, "");
+  if (handle) sp.handle = handle;
+  if (pendingAvatar) sp.avatar = pendingAvatar;
   if (state.editingSpeakerIdx === null) {
-    state.speakers.push({ name, key, color });
+    state.speakers.push(sp);
   } else {
     const oldName = state.speakers[state.editingSpeakerIdx].name;
-    state.speakers[state.editingSpeakerIdx] = { name, key, color };
+    state.speakers[state.editingSpeakerIdx] = sp;
     if (oldName !== name) {
       state.cards.forEach((c) => { if (c.speaker === oldName) c.speaker = name; });
       state.lanes.forEach((l) => { if (l.speaker === oldName) { l.speaker = name; if (l.name === oldName) l.name = name; } });
@@ -531,62 +586,49 @@ $("#spDelete").addEventListener("click", () => {
 });
 
 // ---------- fonts ----------
+// The video font and each speaker's own font are picked from every installed font in one browser. Previews
+// use the browser's own access to installed fonts (CSS family names), so the list scrolls without loading
+// font files; a font from settings.json "font_dirs" (not installed) falls back to loading its file.
 
-let fontIndex = null; // /fonts list, fetched the first time the picker opens
+let fontIndex = null;      // /fonts list, fetched the first time the browser opens
+let fontPickTarget = null; // "video", or the speaker being edited
 
-function renderFontSelect() {
-  const sel = $("#fontSelect");
-  const opts = FONTS.map((f) => ({ family: f, file: null }));
-  state.favoriteFonts.forEach((f) => { if (!opts.some((o) => o.family === f.family)) opts.push(f); });
-  if (!opts.some((o) => o.family === state.font)) opts.push({ family: state.font, file: state.fontFile });
-  sel.innerHTML = opts.map((o) => `<option value="${esc(o.family)}" data-file="${esc(o.file || "")}">${esc(o.family)}${o.file && !FONTS.includes(o.family) ? " ★" : ""}</option>`).join("");
-  sel.value = state.font;
+const cssFamily = (family) => `"${family.replace(/"/g, "")}"`;
+
+function renderFontButton() {
+  const b = $("#fontPickerBtn");
+  b.textContent = state.font + "  ▾";
+  b.style.fontFamily = `${cssFamily(state.font)}, var(--sans)`;
 }
 
 function setFont(family, file) {
-  if (state.font === family && state.fontFile === file) return;
+  if (state.font === family && state.fontFile === (file || null)) return;
   state.font = family;
   state.fontFile = FONTS.includes(family) ? null : (file || null);
-  renderFontSelect();
-  applyOverlayFont();
+  renderFontButton();
   markDirty(true);
 }
 
-$("#fontSelect").addEventListener("change", (e) => {
-  const opt = e.target.selectedOptions[0];
-  setFont(e.target.value, opt ? opt.dataset.file : null);
-});
-
-const loadedFaces = new Map();
-
-async function previewFace(i) {
-  if (!loadedFaces.has(i)) {
-    const face = new FontFace(`cabpv${i}`, `url(/fontfile?i=${i})`);
-    loadedFaces.set(i, face.load().then((f) => { document.fonts.add(f); return f; }).catch(() => null));
-  }
-  return loadedFaces.get(i);
+async function getFontIndex() {
+  if (!fontIndex) fontIndex = await (await fetch("/fonts")).json().catch(() => []);
+  return fontIndex;
 }
 
-async function applyOverlayFont() {
-  const overlay = $("#overlay");
-  overlay.style.fontFamily = `"${state.font}", Impact, "Arial Black", sans-serif`;
-  if (!state.fontFile) return;
-  const list = fontIndex || (fontIndex = await (await fetch("/fonts")).json().catch(() => []));
-  const i = list.findIndex((f) => f.file === state.fontFile);
-  if (i >= 0 && await previewFace(i)) overlay.style.fontFamily = `cabpv${i}, Impact, sans-serif`;
-}
-
-$("#fontPickerBtn").addEventListener("click", async () => {
+async function openFontBrowser(target) {
+  fontPickTarget = target;
+  $("#fontModalHint").textContent = target === "video"
+    ? "Click a font to use it for this video. ★ pins it to the top of the list."
+    : `Click a font for ${$("#spName").value || "this speaker"}'s captions. ★ pins it to the top of the list.`;
   $("#fontModal").classList.remove("hidden");
+  $("#fontSearch").value = "";
   $("#fontSearch").focus();
-  if (!fontIndex) {
-    $("#fontList").innerHTML = `<p class="hint">Reading installed fonts…</p>`;
-    fontIndex = await (await fetch("/fonts")).json().catch(() => []);
-  }
+  if (!fontIndex) $("#fontList").innerHTML = `<p class="hint">Reading installed fonts…</p>`;
+  await getFontIndex();
   renderFontList();
-});
+}
 
-$("#fontModalClose").addEventListener("click", () => { $("#fontModal").classList.add("hidden"); blurFocused(); });
+$("#fontPickerBtn").addEventListener("click", () => openFontBrowser("video"));
+$("#fontModalClose").addEventListener("click", () => { $("#fontModal").classList.add("hidden"); });
 $("#fontSearch").addEventListener("input", () => renderFontList());
 $("#fontSample").addEventListener("input", () => {
   document.querySelectorAll(".font-item .fsample").forEach((el) => { el.textContent = $("#fontSample").value; });
@@ -595,11 +637,17 @@ $("#fontSample").addEventListener("input", () => {
 const faceObserver = new IntersectionObserver((entries) => {
   entries.forEach((en) => {
     if (!en.isIntersecting) return;
-    const i = +en.target.dataset.i;
     faceObserver.unobserve(en.target);
-    previewFace(i).then((f) => { if (f) en.target.querySelector(".fsample").style.fontFamily = `cabpv${i}`; });
+    const i = en.target.dataset.i;
+    const f = fontIndex[+i];
+    const sample = en.target.querySelector(".fsample");
+    sample.style.fontFamily = `${cssFamily(f.family)}, var(--sans)`;
+    if (!document.fonts.check(`16px ${cssFamily(f.family)}`)) { // not installed (a font_dirs file): load it
+      new FontFace(`cabpv${i}`, `url(/fontfile?i=${i})`).load()
+        .then((face) => { document.fonts.add(face); sample.style.fontFamily = `cabpv${i}`; }).catch(() => {});
+    }
   });
-}, { root: $("#fontList") });
+}, { root: $("#fontList"), rootMargin: "200px" });
 
 function renderFontList() {
   const q = $("#fontSearch").value.trim().toLowerCase();
@@ -609,16 +657,16 @@ function renderFontList() {
   (fontIndex || []).forEach((f, i) => {
     if (seen.has(f.family) || (q && !f.family.toLowerCase().includes(q))) return;
     seen.add(f.family); // one row per family, its Regular (or first) style
-    rows.push({ ...f, i });
+    rows.push({ ...f, i, fav: state.favoriteFonts.some((x) => x.family === f.family) });
   });
-  const shown = rows.slice(0, 250);
+  rows.sort((a, b) => b.fav - a.fav); // pinned first, then alphabetical (the server sorts)
+  const current = fontPickTarget === "video" ? state.font : pendingSpeakerFont.family;
+  const shown = rows.slice(0, 600);
   const list = $("#fontList");
-  list.innerHTML = shown.map((f) => {
-    const fav = state.favoriteFonts.some((x) => x.family === f.family);
-    return `<div class="font-item${f.family === state.font ? " current" : ""}" data-i="${f.i}">
-      <span class="star${fav ? " on" : ""}" title="Show in the Font dropdown">${fav ? "★" : "☆"}</span>
-      <span class="fname">${esc(f.family)}</span><span class="fsample">${sample}</span></div>`;
-  }).join("") + (rows.length > shown.length ? `<p class="hint">${rows.length - shown.length} more: type to narrow down</p>` : "");
+  list.innerHTML = shown.map((f) => `<div class="font-item${f.family === current ? " current" : ""}" data-i="${f.i}">
+      <span class="star${f.fav ? " on" : ""}" title="Pin to the top">${f.fav ? "★" : "☆"}</span>
+      <span class="fname">${esc(f.family)}</span><span class="fsample">${sample}</span></div>`).join("")
+    + (rows.length > shown.length ? `<p class="hint">${rows.length - shown.length} more: type to narrow down</p>` : "");
   list.querySelectorAll(".font-item").forEach((el) => {
     const f = fontIndex[+el.dataset.i];
     faceObserver.observe(el);
@@ -627,11 +675,62 @@ function renderFontList() {
       const k = state.favoriteFonts.findIndex((x) => x.family === f.family);
       if (k >= 0) state.favoriteFonts.splice(k, 1); else state.favoriteFonts.push({ family: f.family, file: f.file });
       saveSettingsSoon();
-      renderFontSelect();
       renderFontList();
     });
-    el.addEventListener("click", () => { setFont(f.family, f.file); renderFontList(); });
+    el.addEventListener("click", () => {
+      if (fontPickTarget === "video") setFont(f.family, f.file);
+      else { pendingSpeakerFont = { family: f.family, file: FONTS.includes(f.family) ? null : f.file }; renderSpeakerFontButton(); }
+      $("#fontModal").classList.add("hidden");
+    });
   });
+}
+
+// the speaker editor's font choice, applied when the speaker is saved
+let pendingSpeakerFont = { family: null, file: null };
+
+function renderSpeakerFontButton() {
+  const b = $("#spFontBtn");
+  b.textContent = (pendingSpeakerFont.family || "Same as the video") + "  ▾";
+  b.style.fontFamily = pendingSpeakerFont.family ? `${cssFamily(pendingSpeakerFont.family)}, var(--sans)` : "";
+}
+
+$("#spFontBtn").addEventListener("click", () => openFontBrowser("speaker"));
+$("#spFontClear").addEventListener("click", () => { pendingSpeakerFont = { family: null, file: null }; renderSpeakerFontButton(); });
+
+// ---------- speaker profile pictures (for the voice overlay) ----------
+// Picked with the normal file dialog, uploaded to the server, which keeps a square copy in its git-ignored
+// avatars/ folder. The speaker stores that file's path, which the renderer reads.
+
+let pendingAvatar = null;
+const avatarUrl = (path) => path ? "/avatars/" + encodeURIComponent(path.split(/[\\/]/).pop()) + "?v=" + avatarBust : "";
+let avatarBust = Date.now();
+
+function renderSpeakerAvatar() {
+  const img = $("#spAvatarImg");
+  img.src = pendingAvatar ? avatarUrl(pendingAvatar) : "";
+  img.classList.toggle("empty", !pendingAvatar);
+}
+
+$("#spAvatarBtn").addEventListener("click", async () => {
+  const name = $("#spName").value.trim();
+  if (!name) { $("#speakerFormError").textContent = "Give the speaker a name first."; return; }
+  try {
+    const [h] = await window.showOpenFilePicker({ types: [{ description: "Picture", accept: { "image/*": [".png", ".jpg", ".jpeg", ".webp", ".gif"] } }] });
+    const res = await fetch("/avatar?name=" + encodeURIComponent(name), { method: "POST", body: await h.getFile() });
+    if (!res.ok) throw new Error(await res.text());
+    pendingAvatar = (await res.json()).path;
+    avatarBust = Date.now();
+    renderSpeakerAvatar();
+  } catch (e) {
+    if (e.name !== "AbortError") $("#speakerFormError").textContent = "Couldn't use that picture: " + e.message;
+  }
+});
+$("#spAvatarClear").addEventListener("click", () => { pendingAvatar = null; renderSpeakerAvatar(); });
+
+// the font a caption previews in: its speaker's own font, else the video's
+function cardFontFamily(card) {
+  const sp = card.speaker ? speakerByName(card.speaker) : null;
+  return `${cssFamily(sp && sp.font ? sp.font : state.font)}, Impact, "Arial Black", sans-serif`;
 }
 
 // ---------- help ----------
@@ -824,6 +923,7 @@ function buildRow(card) {
     return b;
   };
   const emojiBtn = iconBtn("😀", "Insert emoji", (b) => openEmojiPicker(b, text));
+  const gifBtn = iconBtn("GIF", "Search GIPHY and put a GIF link in this caption's PROD NOTES", (b) => openGifPicker(notes, card, b), "gif-btn");
   const insertBtn = iconBtn("+", "Add a blank caption after this one", () => insertCardAfter(id));
   const deleteBtn = iconBtn("✕", "Delete this caption", () => deleteCards([id]), "danger");
 
@@ -831,7 +931,7 @@ function buildRow(card) {
   notesArea.className = "notes-area";
   notesArea.append(notesLabel, notes);
 
-  row.append(handle, seekBtn, startInput, sep, endInput, text, notesArea, noteChip, badge, laneSel, emojiBtn, insertBtn, deleteBtn);
+  row.append(handle, seekBtn, startInput, sep, endInput, text, notesArea, noteChip, badge, laneSel, emojiBtn, gifBtn, insertBtn, deleteBtn);
   updateNoteChip(row, card);
   updateBadge(row, card);
   return row;
@@ -985,6 +1085,78 @@ document.addEventListener("click", (e) => {
   if (!emojiPickerEl.classList.contains("hidden") && !emojiPickerEl.contains(e.target)) closeEmojiPicker();
   if (!$("#lanesMenu").classList.contains("hidden") && !e.target.closest(".menu-wrap")) $("#lanesMenu").classList.add("hidden");
 });
+
+// ---------- GIF search (GIPHY) ----------
+// Needs a GIPHY API key as "giphy_key" in settings.json next to server.py (local only, never committed).
+// Clicking a result appends its link to the caption's PROD NOTES; the renderer downloads note links.
+
+let gifTarget = null;
+let gifTimer = null;
+
+function openGifPicker(notesInput, card, anchor) {
+  gifTarget = notesInput;
+  $("#gifModalTitle").textContent = `GIF for “${card.lines.join(" ") || "blank caption"}”`;
+  const pop = $("#gifPop");
+  pop.classList.remove("hidden");
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = clamp(r.right - pop.offsetWidth, 8, window.innerWidth - pop.offsetWidth - 8) + "px";
+  pop.style.top = (r.bottom + pop.offsetHeight + 8 < window.innerHeight ? r.bottom + 6 : Math.max(8, r.top - pop.offsetHeight - 6)) + "px";
+  const q = $("#gifSearch");
+  if (!q.value) q.value = card.lines.join(" ").toLowerCase();
+  q.focus();
+  q.select();
+  searchGifs();
+}
+
+async function searchGifs() {
+  const grid = $("#gifGrid");
+  const key = settings.giphy_key;
+  if (!key) {
+    grid.innerHTML = `<p class="hint">Add your GIPHY API key to settings.json as "giphy_key", then restart Cabtions.</p>`;
+    return;
+  }
+  const q = $("#gifSearch").value.trim();
+  const url = q
+    ? `https://api.giphy.com/v1/gifs/search?api_key=${encodeURIComponent(key)}&q=${encodeURIComponent(q)}&limit=30&rating=pg-13`
+    : `https://api.giphy.com/v1/gifs/trending?api_key=${encodeURIComponent(key)}&limit=30&rating=pg-13`;
+  grid.innerHTML = `<p class="hint">Searching…</p>`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`GIPHY said ${res.status}`);
+    const data = (await res.json()).data || [];
+    if (!data.length) { grid.innerHTML = `<p class="hint">Nothing for “${esc(q)}”.</p>`; return; }
+    grid.innerHTML = data.map((g, i) => {
+      const prev = g.images.fixed_height_small || g.images.fixed_height;
+      return `<button class="gif-item" data-i="${i}" title="${esc(g.title || "")}"><img src="${esc(prev.url)}" loading="lazy" alt=""></button>`;
+    }).join("");
+    grid.querySelectorAll(".gif-item").forEach((b) => b.addEventListener("click", () => {
+      const g = data[+b.dataset.i];
+      insertGifLink((g.images.downsized_medium || g.images.original).url.split("?")[0]);
+    }));
+  } catch (e) {
+    grid.innerHTML = `<p class="error">GIF search failed: ${esc(e.message)}</p>`;
+  }
+}
+
+function insertGifLink(link) {
+  if (!gifTarget) return;
+  gifTarget.value = (gifTarget.value.trim() + " " + link).trim();
+  gifTarget.dispatchEvent(new Event("change", { bubbles: true })); // reuses the notes field's undo push
+  closeGifPicker();
+}
+
+function closeGifPicker() {
+  $("#gifPop").classList.add("hidden");
+  gifTarget = null;
+}
+
+document.addEventListener("mousedown", (e) => {
+  if (!$("#gifPop").classList.contains("hidden") && !e.target.closest("#gifPop, .gif-btn")) closeGifPicker();
+});
+
+$("#gifSearch").addEventListener("input", () => { clearTimeout(gifTimer); gifTimer = setTimeout(searchGifs, 350); });
+$("#gifModalClose").addEventListener("click", closeGifPicker);
+$("#gifSearch").addEventListener("keydown", (e) => { if (e.key === "Escape") closeGifPicker(); });
 
 // ---------- selection (shared by the list and the timeline) ----------
 
@@ -1181,11 +1353,13 @@ function renderTimeline() {
   wave.className = "tl-wave";
   wave.style.width = width + "px";
   wave.innerHTML = `<canvas id="tlWave"></canvas>`;
-  wave.addEventListener("mousedown", (e) => startScrub(e, wave));
+  wave.addEventListener("mousedown", (e) => startRangeSelect(e, wave));
+  wave.title = "Drag to select a stretch to trim · click to move the playhead";
   row("Audio", "tl-wave-label", wave);
 
   // speaker / caption timelines
   state.lanes.forEach((ln, lane) => {
+    if (ln.hidden) return; // hidden from view only - its captions still exist and still render
     const track = document.createElement("div");
     track.className = "tl-lane-track";
     track.dataset.lane = lane;
@@ -1201,6 +1375,12 @@ function renderTimeline() {
       lane === state.activeLane ? "active" : "", track);
     label.title = "Click: “+ Add caption” uses this timeline";
     label.addEventListener("click", () => { state.activeLane = lane; renderTimeline(); });
+    const hide = document.createElement("button");
+    hide.className = "tl-lane-hide";
+    hide.textContent = "–";
+    hide.title = "Hide this timeline (its captions stay, and still render)";
+    hide.addEventListener("click", (e) => { e.stopPropagation(); setLaneHidden(lane, true); });
+    label.appendChild(hide);
   });
 
   const ph = document.createElement("div");
@@ -1211,6 +1391,7 @@ function renderTimeline() {
   scroll.scrollTop = st;
   placePlayhead();
   drawWaveform();
+  drawTrimLayer();
 }
 
 function blockColors(card) {
@@ -1229,9 +1410,35 @@ function makeBlock(card) {
   const label = document.createElement("span");
   label.className = "tl-text";
   b.append(hl, label, hr);
-  b.addEventListener("mousedown", (e) => onBlockMouseDown(e, card._id));
+  b.addEventListener("mousedown", (e) => { hideBlockTip(); onBlockMouseDown(e, card._id); });
+  b.addEventListener("mouseenter", () => { if (!tlDrag && !marquee) showBlockTip(b, card._id); });
+  b.addEventListener("mouseleave", hideBlockTip);
   positionBlock(b, card);
   return b;
+}
+
+// Hover pop-out with a block's full caption (blocks are often too narrow to show the whole word): above the
+// block, or below it when there's no room above.
+function showBlockTip(b, id) {
+  const card = cardById(id);
+  if (!card) return;
+  const tip = $("#tlTip");
+  const sp = card.speaker ? speakerByName(card.speaker) : null;
+  tip.innerHTML = `<b>${esc(card.lines.join(" / ") || "(blank)")}</b>` +
+    `<span>${esc(card.speaker || "untagged")} · ${card.start.toFixed(2)}–${card.end.toFixed(2)}s</span>` +
+    (card.note ? `<em>📝 ${esc(card.note)}</em>` : "");
+  tip.style.setProperty("--c", sp ? sp.color : "#59625d");
+  tip.classList.remove("hidden");
+  const r = b.getBoundingClientRect();
+  const left = clamp(r.left + r.width / 2 - tip.offsetWidth / 2, 6, window.innerWidth - tip.offsetWidth - 6);
+  let top = r.top - tip.offsetHeight - 8;
+  if (top < 6) top = r.bottom + 8;
+  tip.style.left = left + "px";
+  tip.style.top = top + "px";
+}
+
+function hideBlockTip() {
+  $("#tlTip").classList.add("hidden");
 }
 
 function positionBlock(b, card) {
@@ -1240,7 +1447,6 @@ function positionBlock(b, card) {
   b.style.width = Math.max(6, (card.end - card.start) * state.pps) + "px";
   b.style.background = bg;
   b.style.color = fg;
-  b.title = `${card.lines.join(" / ")}\n${card.start.toFixed(2)}s – ${card.end.toFixed(2)}s` + (card.note ? `\n📝 ${card.note}` : "");
   b.querySelector(".tl-text").textContent = card.lines.join(" / ") + (card.note ? " 📝" : "");
 }
 
@@ -1251,10 +1457,10 @@ function updateBlock(card) {
 
 function laneAtY(clientY) {
   const tracks = [...document.querySelectorAll(".tl-lane-track")];
-  for (let i = 0; i < tracks.length; i++) {
-    if (clientY < tracks[i].getBoundingClientRect().bottom) return i;
+  for (const t of tracks) {
+    if (clientY < t.getBoundingClientRect().bottom) return +t.dataset.lane;
   }
-  return Math.max(0, tracks.length - 1);
+  return tracks.length ? +tracks[tracks.length - 1].dataset.lane : 0;
 }
 
 function placePlayhead() {
@@ -1371,6 +1577,7 @@ function onBlockMouseDown(e, id) {
 
 document.addEventListener("mousemove", (e) => {
   if (scrubbing) { scrubTo(e.clientX); return; }
+  if (rangeDrag) { updateRangeSelect(e); return; }
   if (marquee) { updateMarquee(e); return; }
   if (!tlDrag) return;
   const dx = e.clientX - tlDrag.startX;
@@ -1419,6 +1626,7 @@ document.addEventListener("mousemove", (e) => {
 
 document.addEventListener("mouseup", (e) => {
   scrubbing = null;
+  if (rangeDrag) { endRangeSelect(e); return; }
   if (marquee) { endMarquee(e); return; }
   if (!tlDrag) return;
   const d = tlDrag;
@@ -1480,6 +1688,123 @@ $("#tlScroll").addEventListener("wheel", (e) => {
 }, { passive: false });
 window.addEventListener("resize", () => drawWaveform());
 
+// -- autosort: every tagged caption onto its speaker's timeline --
+
+$("#autosortBtn").addEventListener("click", () => {
+  const before = snapshotLayout();
+  let moved = 0;
+  state.cards.forEach((c) => {
+    if (!c.speaker) return;
+    const lane = laneForSpeaker(c.speaker);
+    if (laneOf(c) !== lane) { setLane(c, lane); moved++; }
+  });
+  const btn = $("#autosortBtn");
+  btn.textContent = moved ? `⇅ Moved ${moved}` : "⇅ All sorted";
+  setTimeout(() => { btn.textContent = "⇅ Autosort"; }, 1500);
+  if (!moved && before.lanes.length === laneCount()) return;
+  pushLayoutUndo(before);
+  markDirty();
+  sortCards();
+  renderWords();
+  renderTimeline();
+});
+
+// -- trimming: select a stretch on the Audio row, then ✂ Trim (or Delete) --
+// Trims are stretches of video cut out at render time (saved as "trims" in the speakers file). Captions
+// keep their original times; the preview just skips the trimmed stretches.
+
+function mergeRanges(ranges) {
+  const out = [];
+  ranges.map((r) => [...r]).sort((a, b) => a[0] - b[0]).forEach((r) => {
+    const last = out[out.length - 1];
+    if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]); else out.push(r);
+  });
+  return out;
+}
+
+function setTrims(next) {
+  const before = state.trims.map((r) => [...r]);
+  const after = mergeRanges(next);
+  const apply = (t) => { state.trims = t.map((r) => [...r]); state.trimSel = null; renderTimeline(); updateTrimBtn(); };
+  apply(after);
+  pushUndo({ undo: () => apply(before), redo: () => apply(after) });
+  markDirty();
+}
+
+function trimSelection() {
+  if (!state.trimSel || state.trimSel[1] - state.trimSel[0] < 0.05) return false;
+  setTrims([...state.trims, state.trimSel]);
+  return true;
+}
+
+function updateTrimBtn() {
+  const sel = state.trimSel;
+  $("#trimBtn").disabled = !sel;
+  $("#trimBtn").textContent = sel ? `✂ Trim ${(sel[1] - sel[0]).toFixed(2)}s` : "✂ Trim";
+}
+
+$("#trimBtn").addEventListener("click", trimSelection);
+
+const inTrim = (t) => state.trims.find((r) => t >= r[0] && t < r[1]);
+
+let rangeDrag = null;
+
+function startRangeSelect(e, el) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const t = clamp((e.clientX - el.getBoundingClientRect().left) / state.pps, 0, timelineSeconds());
+  rangeDrag = { el, t0: t, x0: e.clientX, moved: false };
+}
+
+function updateRangeSelect(e) {
+  const d = rangeDrag;
+  if (!d.moved && Math.abs(e.clientX - d.x0) < 4) return;
+  d.moved = true;
+  const t = clamp((e.clientX - d.el.getBoundingClientRect().left) / state.pps, 0, timelineSeconds());
+  const snap = (v) => Math.round(v * FPS) / FPS;
+  state.trimSel = [snap(Math.min(d.t0, t)), snap(Math.max(d.t0, t))];
+  drawTrimLayer();
+  updateTrimBtn();
+}
+
+function endRangeSelect(e) {
+  const d = rangeDrag;
+  rangeDrag = null;
+  if (d.moved) return;
+  state.trimSel = null; // a plain click: clear the stretch and move the playhead there
+  drawTrimLayer();
+  updateTrimBtn();
+  video().currentTime = d.t0;
+  placePlayhead();
+}
+
+// hatched trimmed stretches (with ↺ to restore) and the pending selection, over every row
+function drawTrimLayer() {
+  document.querySelectorAll(".tl-trim, .tl-trimsel").forEach((el) => el.remove());
+  const content = tlContent();
+  const h = content.scrollHeight;
+  state.trims.forEach((r, i) => {
+    const el = document.createElement("div");
+    el.className = "tl-trim";
+    Object.assign(el.style, { left: LABEL_W + r[0] * state.pps + "px", width: Math.max(2, (r[1] - r[0]) * state.pps) + "px", height: h + "px" });
+    el.title = `Trimmed ${r[0].toFixed(2)}s – ${r[1].toFixed(2)}s (cut out when rendered)`;
+    const undo = document.createElement("button");
+    undo.className = "tl-trim-undo";
+    undo.textContent = "↺";
+    undo.title = "Bring this stretch back";
+    undo.addEventListener("mousedown", (e) => e.stopPropagation());
+    undo.addEventListener("click", () => setTrims(state.trims.filter((_, k) => k !== i)));
+    el.appendChild(undo);
+    content.appendChild(el);
+  });
+  if (state.trimSel) {
+    const el = document.createElement("div");
+    el.className = "tl-trimsel";
+    Object.assign(el.style, { left: LABEL_W + state.trimSel[0] * state.pps + "px", width: (state.trimSel[1] - state.trimSel[0]) * state.pps + "px", height: h + "px" });
+    content.appendChild(el);
+  }
+}
+
 // -- show / hide / add timelines --
 
 function renderLanesMenu() {
@@ -1487,9 +1812,8 @@ function renderLanesMenu() {
   const items = [];
   state.lanes.forEach((l, i) => {
     const n = state.cards.filter((c) => laneOf(c) === i).length;
-    const canHide = n === 0 && laneCount() > 1;
-    items.push(`<div class="menu-item${canHide ? "" : " disabled"}" data-hide="${i}" title="${canHide ? "Hide this timeline" : n ? "Has captions - move them off to hide it" : "The last timeline can't be hidden"}">
-      <span class="check">✓</span><span class="dot" style="background:${laneColor(l)}"></span>${esc(l.name)}<span class="meta">${n}</span></div>`);
+    items.push(`<div class="menu-item" data-toggle="${i}" title="${l.hidden ? "Show" : "Hide"} this timeline (captions are kept either way)">
+      <span class="check">${l.hidden ? "" : "✓"}</span><span class="dot" style="background:${laneColor(l)}"></span>${esc(l.name)}<span class="meta">${n}${l.hidden ? " · hidden" : ""}</span></div>`);
   });
   state.speakers.filter((s) => !state.lanes.some((l) => l.speaker === s.name)).forEach((s) => {
     items.push(`<div class="menu-item" data-show="${esc(s.name)}" title="Show ${esc(s.name)}'s timeline">
@@ -1497,8 +1821,9 @@ function renderLanesMenu() {
   });
   items.push(`<div class="menu-sep"></div><div class="menu-item" data-add="1"><span class="check">+</span>Add new timeline</div>`);
   menu.innerHTML = items.join("");
-  menu.querySelectorAll("[data-hide]").forEach((el) => el.addEventListener("click", () => {
-    if (!el.classList.contains("disabled")) hideLane(+el.dataset.hide);
+  menu.querySelectorAll("[data-toggle]").forEach((el) => el.addEventListener("click", () => {
+    const i = +el.dataset.toggle;
+    setLaneHidden(i, !state.lanes[i].hidden);
   }));
   menu.querySelectorAll("[data-show]").forEach((el) => el.addEventListener("click", () => {
     const before = snapshotLayout();
@@ -1516,11 +1841,12 @@ function renderLanesMenu() {
   });
 }
 
-function hideLane(i) {
+// Hiding is view-only: the timeline's captions stay put, show in the caption list, and still render.
+function setLaneHidden(i, hidden) {
+  if (hidden && state.lanes.filter((l) => !l.hidden).length <= 1) return; // keep at least one on screen
   const before = snapshotLayout();
-  state.lanes.splice(i, 1);
-  state.cards.forEach((c) => { if (laneOf(c) > i) setLane(c, laneOf(c) - 1); });
-  state.activeLane = Math.min(state.activeLane, laneCount() - 1);
+  if (hidden) state.lanes[i].hidden = true; else delete state.lanes[i].hidden;
+  if (hidden && state.activeLane === i) state.activeLane = state.lanes.findIndex((l) => !l.hidden);
   pushLayoutUndo(before);
   afterLanesChange();
 }
@@ -1583,12 +1909,13 @@ updateHistoryButtons();
 
 const REACTION_LEEWAY = 0.35; // seconds of tolerance for a slightly-late keypress
 
-// The caption a "tag the current word" keypress means: the most recently started one (any timeline).
-function currentCardIndex(t) {
+// The most recently started caption (any timeline). Tagging passes REACTION_LEEWAY so a slightly-late
+// keypress still lands; everything else (highlight, preview, seeking) uses the exact time.
+function currentCardIndex(t, leeway = 0) {
   let best = -1;
   for (let i = 0; i < state.cards.length; i++) {
     const c = state.cards[i];
-    if (c.start > t + REACTION_LEEWAY) break;
+    if (c.start > t + leeway) break;
     if (best < 0 || c.start > state.cards[best].start) best = i;
   }
   return best;
@@ -1597,7 +1924,7 @@ function currentCardIndex(t) {
 function currentCardInLane(t, lane) {
   let best = null;
   for (const c of state.cards) {
-    if (c.start > t + REACTION_LEEWAY) break;
+    if (c.start > t + 0.001) break;
     if (laneOf(c) === lane) best = c;
   }
   return best;
@@ -1607,11 +1934,12 @@ function currentCardInLane(t, lane) {
 function assignSpeaker(name) {
   const targets = state.selection.size > 0
     ? [...state.selection].map(cardById).filter(Boolean)
-    : (() => { const i = currentCardIndex(video().currentTime); return i < 0 ? [] : [state.cards[i]]; })();
+    : (() => { const i = currentCardIndex(video().currentTime, REACTION_LEEWAY); return i < 0 ? [] : [state.cards[i]]; })();
   const todo = targets.filter((c) => c.speaker !== name || state.lanes[laneOf(c)]?.speaker !== name);
   if (todo.length) {
     const before = snapshotLayout();
     const lane = laneForSpeaker(name);
+    delete state.lanes[lane].hidden;
     todo.forEach((c) => { c.speaker = name; setLane(c, lane); });
     pushLayoutUndo(before);
     markDirty();
@@ -1626,11 +1954,19 @@ function assignSpeaker(name) {
 
 // ---------- keys ----------
 
+// Only real text entry swallows hotkeys. Sliders, buttons, checkboxes and dropdowns don't - after you click
+// one, B/J/Space must still tag and play instead of needing a click back into the caption list.
 function isTypingTarget(el) {
   if (!el) return false;
-  const tag = el.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
+  if (el.isContentEditable || el.tagName === "TEXTAREA") return true;
+  return el.tagName === "INPUT" && !["range", "checkbox", "radio", "button", "color"].includes(el.type);
 }
+
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("button, input[type=range], input[type=checkbox]");
+  if (el && !el.closest(".modal")) el.blur(); // a focused button would also catch Space as a click
+});
+document.addEventListener("change", (e) => { if (e.target.matches("select, input[type=range]")) e.target.blur(); });
 
 const openModal = () => [...document.querySelectorAll(".modal")].find((m) => !m.classList.contains("hidden"));
 
@@ -1646,11 +1982,16 @@ document.addEventListener("keydown", (e) => {
   if (e.key === ">" || e.key === ".") { e.preventDefault(); v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 5); return; }
   if (e.key === "Enter") { e.preventDefault(); v.currentTime = 0; return; }
   if (e.key === "Backspace") { e.preventDefault(); if (e.shiftKey) redoLast(); else undoLast(); return; }
-  if (e.key === "Delete") { e.preventDefault(); deleteCards([...state.selection]); return; }
+  if (e.key === "Delete") {
+    e.preventDefault();
+    if (state.selection.size) deleteCards([...state.selection]); else trimSelection();
+    return;
+  }
   if (e.key === "Escape") {
     e.preventDefault();
     clearSelection();
     $("#lanesMenu").classList.add("hidden");
+    if (state.trimSel) { state.trimSel = null; drawTrimLayer(); updateTrimBtn(); }
     return;
   }
   if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
@@ -1684,14 +2025,16 @@ function updateOverlay() {
     const card = currentCardInLane(t, lane);
     if (card && t <= card.end + 0.4 && card.lines.join("").trim()) active.push(card);
   }
-  const key = active.map((c) => c._id + ":" + c.lines.join("|") + ":" + c.speaker).join(",");
+  const key = active.map((c) => c._id + ":" + c.lines.join("|") + ":" + c.speaker).join(",") + state.font;
   if (overlay.dataset.key !== key) {
     overlay.dataset.key = key;
     overlay.innerHTML = active.map((c, i) => {
       const sp = c.speaker ? speakerByName(c.speaker) : null;
-      return `<div class="ov-line${i ? " ov-sub" : ""}" style="color:${sp ? sp.color : "#fff"}">${esc(c.lines.join("\n").toUpperCase())}</div>`;
+      return `<div class="ov-line${i ? " ov-sub" : ""}" style="color:${sp ? sp.color : "#fff"};font-family:${esc(cardFontFamily(c))}">${esc(c.lines.join("\n").toUpperCase())}</div>`;
     }).join("");
   }
+
+  updateVoiceOverlay(new Set(active.map((c) => c.speaker).filter(Boolean)));
 
   const idx = currentCardIndex(t);
   document.querySelectorAll(".word-row.current").forEach((r) => r.classList.remove("current"));
@@ -1702,6 +2045,27 @@ function updateOverlay() {
     if (state.followVideo && !video().paused) scrollRowIntoList(state.cards[idx]._id);
   }
 }
+
+// "Who's talking" overlay preview: every speaker in this video as a small avatar + name, bottom-left of the
+// facecam; the ones with a caption on screen light up in their colour. Mirrors render_captions.py.
+function updateVoiceOverlay(activeSpeakers) {
+  const el = $("#voiceOverlay");
+  if (!state.voiceOverlay) { el.innerHTML = ""; el.dataset.key = ""; return; }
+  const present = state.lanes.map((l) => l.speaker).filter((n) => n && state.cards.some((c) => c.speaker === n));
+  state.cards.forEach((c) => { if (c.speaker && !present.includes(c.speaker)) present.push(c.speaker); });
+  const key = present.join(",") + "|" + [...activeSpeakers].join(",");
+  if (el.dataset.key === key) return;
+  el.dataset.key = key;
+  el.innerHTML = present.map((n) => {
+    const sp = speakerByName(n);
+    const color = sp ? sp.color : "#9aa4ab";
+    const on = activeSpeakers.has(n);
+    const av = sp && sp.avatar ? `<img class="vo-av" src="${esc(avatarUrl(sp.avatar))}" alt="">` : `<span class="vo-av">${esc(n[0].toUpperCase())}</span>`;
+    return `<div class="vo-row${on ? " on" : ""}" style="--c:${color}">${av}<span class="vo-name">${esc(sp && sp.handle ? "@" + sp.handle : n)}</span></div>`;
+  }).join("");
+}
+
+$("#voiceToggle").addEventListener("change", (e) => { state.voiceOverlay = e.target.checked; markDirty(); });
 
 function followTimeline() {
   if (!state.followVideo || tlDrag || scrubbing || marquee) return;
@@ -1716,6 +2080,8 @@ function followTimeline() {
 function tick() {
   const v = video();
   if (v.duration && !$("#editor").classList.contains("hidden")) {
+    const cut = !v.paused && inTrim(v.currentTime);
+    if (cut) v.currentTime = Math.min(cut[1], v.duration);
     updateOverlay();
     placePlayhead();
     followTimeline();
@@ -1747,6 +2113,7 @@ $("#saveBtn").addEventListener("click", async () => {
       state.speakersHandle = await window.showSaveFilePicker({
         suggestedName: state.cardsHandle.name.replace(/\.json$/i, "") + "_speakers.json",
         types: JSON_TYPES,
+        startIn: state.cardsHandle,
       });
     } catch (e) {
       if (e.name === "AbortError") return; // cancelled - keep the edits
@@ -1777,7 +2144,8 @@ $("#saveBtn").addEventListener("click", async () => {
     }
     return out;
   });
-  const sidecar = { font: state.font, speakers: state.speakers, lanes: state.lanes };
+  const sidecar = { font: state.font, speakers: state.speakers, lanes: state.lanes, voice_overlay: state.voiceOverlay };
+  if (state.trims.length) sidecar.trims = state.trims;
   if (state.fontFile) sidecar.font_file = state.fontFile;
 
   try {
