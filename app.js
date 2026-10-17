@@ -1724,7 +1724,8 @@ function mergeRanges(ranges) {
 
 function setTrims(next) {
   const before = state.trims.map((r) => [...r]);
-  const after = mergeRanges(next);
+  const end = video().duration || Infinity;  // a trim dragged past the end stops at the video's last frame
+  const after = mergeRanges(next.map(([a, b]) => [Math.max(0, a), Math.min(b, end)])).filter(([a, b]) => b - a >= 0.05);
   const apply = (t) => { state.trims = t.map((r) => [...r]); state.trimSel = null; renderTimeline(); updateTrimBtn(); };
   apply(after);
   pushUndo({ undo: () => apply(before), redo: () => apply(after) });
@@ -2101,13 +2102,16 @@ $("#seekBar").addEventListener("change", () => { state.dragging = false; });
 
 // ---------- save ----------
 
-$("#saveBtn").addEventListener("click", async () => {
+$("#saveBtn").addEventListener("click", () => saveProject());
+
+// Returns true once both files are written.
+async function saveProject() {
   const strayStar = state.cards.filter((c) => c.lines.some((l) => l.includes("*"))).length;
-  if (strayStar > 0 && !confirm(`${strayStar} caption${strayStar > 1 ? "s contain" : " contains"} a lone * that would show in the video. Save anyway?`)) return;
+  if (strayStar > 0 && !confirm(`${strayStar} caption${strayStar > 1 ? "s contain" : " contains"} a lone * that would show in the video. Save anyway?`)) return false;
   // A card with no text but a production note is a supported "silent" note-only card; only a card with
   // neither is pointless.
   const emptyCount = state.cards.filter((c) => !c.lines.join("").trim() && !c.note).length;
-  if (emptyCount > 0 && !confirm(`${emptyCount} caption${emptyCount > 1 ? "s have" : " has"} neither text nor a production note, so it won't do anything. Save anyway?`)) return;
+  if (emptyCount > 0 && !confirm(`${emptyCount} caption${emptyCount > 1 ? "s have" : " has"} neither text nor a production note, so it won't do anything. Save anyway?`)) return false;
   if (!state.speakersHandle) {
     try {
       state.speakersHandle = await window.showSaveFilePicker({
@@ -2116,14 +2120,14 @@ $("#saveBtn").addEventListener("click", async () => {
         startIn: state.cardsHandle,
       });
     } catch (e) {
-      if (e.name === "AbortError") return; // cancelled - keep the edits
+      if (e.name === "AbortError") return false; // cancelled - keep the edits
       alert("Couldn't create the speakers file: " + e.message);
-      return;
+      return false;
     }
   }
   if (!(await ensureReadWrite(state.speakersHandle))) {
     alert("Write permission for the speakers file was denied.");
-    return;
+    return false;
   }
 
   sortCards();
@@ -2157,7 +2161,7 @@ $("#saveBtn").addEventListener("click", async () => {
     await spWritable.close();
   } catch (e) {
     alert("Save failed: " + e.message);
-    return;
+    return false;
   }
 
   saveSettingsSoon();
@@ -2167,7 +2171,87 @@ $("#saveBtn").addEventListener("click", async () => {
   const btn = $("#saveBtn");
   btn.textContent = "Saved ✓";
   setTimeout(() => { btn.textContent = "Save"; }, 1200);
+  return true;
+}
+
+// ---------- composite ----------
+// Saves, then asks the local server to run the compositor on this clip's folder and shows its progress.
+
+$("#compositeBtn").addEventListener("click", async () => {
+  const btn = $("#compositeBtn");
+  if (!(await saveProject())) return;
+  const file = await state.videoHandle.getFile();
+  let res;
+  try {
+    const r = await fetch("/composite", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ video: file.name, size: file.size }) });
+    if (!r.ok) throw new Error("the server is an older version - restart Cabtions from the tray icon");
+    res = await r.json();
+  } catch (e) {
+    alert("Couldn't reach the Cabtions server: " + e.message);
+    return;
+  }
+  if (res.error) { alert(res.error); return; }
+  if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
+  btn.textContent = res.ahead ? `Queued (${res.ahead} ahead)` : "Started";
+  setTimeout(() => { btn.textContent = "Ready for composite"; }, 2500);
+  if (!polling) pollComposite();
 });
+
+// The bar under the top bar's buttons; clicking it shows the compositor's output, live.
+const bar = $("#compositeProgress");
+bar.addEventListener("click", () => { $("#logModal").classList.remove("hidden"); scrollLog(); });
+$("#logModalClose").addEventListener("click", () => $("#logModal").classList.add("hidden"));
+const scrollLog = () => { const el = $("#logBody"); el.scrollTop = el.scrollHeight; };
+
+// Several clips can be queued (open the next clip and press the button again); they composite one after another
+// and each one's finish gets its own notification. seenFinished starts at what was already done when Cabtions
+// opened, so reopening it never repeats old notifications.
+let polling = false;
+let seenFinished = null;
+
+async function pollComposite() {
+  polling = true;
+  let job;
+  try { job = await (await fetch("/composite")).json(); } catch { setTimeout(pollComposite, 3000); return; }
+  if (seenFinished === null) seenFinished = job.finished.length ? job.finished[job.finished.length - 1].id : 0;
+  for (const f of job.finished.filter((f) => f.id > seenFinished)) {
+    notify(f.ok ? `Composited: ${f.name}` : `Composite failed: ${f.name}`, f.ok ? f.last : "Click the bar in Cabtions to see why.");
+    seenFinished = f.id;
+  }
+  const queued = job.queue.length ? ` (+${job.queue.length} queued)` : "";
+  const pct = Math.round(job.progress * 100);
+  const step = [...job.log].reverse().find((l) => l.startsWith("[step"));
+  bar.classList.remove("hidden");
+  bar.classList.toggle("failed", !job.running && !job.ok);
+  bar.querySelector(".fill").style.width = pct + "%";
+  bar.querySelector(".label").textContent = job.running
+    ? `${pct}% ${step ? step.replace(/^\[step \d+\/\d+\] /, "") : "starting"}…${queued}`
+    : job.ok ? "Composited ✓ (log)" : "Failed (see log)";
+  const atBottom = $("#logBody").scrollHeight - $("#logBody").scrollTop - $("#logBody").clientHeight < 40;
+  $("#logBody").textContent = job.log.join("\n");
+  $("#logTitle").textContent = "Composite: " + (job.folder || "").split(/[\\/]/).pop();
+  if (atBottom) scrollLog();
+  bar.title = "Show the compositor's output" + (job.queue.length ? "\nQueued: " + job.queue.join(", ") : "");
+  if (job.running || job.queue.length) { setTimeout(pollComposite, 1500); return; }
+  polling = false;
+}
+
+// A Windows notification (the browser's), so a finished render is noticed with Cabtions in the background.
+function notify(title, body) {
+  if ("Notification" in window && Notification.permission === "granted") {
+    const n = new Notification(title, { body, icon: "/assets/icon-192.png" });
+    n.onclick = () => { window.focus(); bar.click(); };
+  } else if (title.includes("failed")) {
+    alert(title + "\n\n" + body);
+  }
+}
+
+// Reopening Cabtions mid-render picks the bar back up.
+fetch("/composite").then((r) => r.json()).then((job) => {
+  seenFinished = job.finished.length ? job.finished[job.finished.length - 1].id : 0;
+  if (job.running || job.queue.length) pollComposite();
+}).catch(() => {});
 
 window.addEventListener("beforeunload", (e) => {
   if (state.dirty) { e.preventDefault(); e.returnValue = ""; }

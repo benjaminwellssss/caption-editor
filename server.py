@@ -11,6 +11,11 @@ This server hands the browser the app's static files, plus three small helpers:
   GET /fontfile?i=N    the Nth font file from /fonts, so the picker can preview it
   POST /avatar?name=X  saves an uploaded profile picture as avatars/X.png (square, 256 px), returns its path
   GET /avatars/X.png   serves one, for the editor's preview
+  POST /composite      {video, size}: finds the clip folder holding that video (under settings.json
+                       "clip_roots") and queues settings.json "composite_script" on it; queued clips run
+                       one after another in the background (one at a time: they share the GPU encoder)
+  GET /composite       the running one's state {running, ok, folder, log, progress 0..1}, plus
+                       queue (clip names waiting) and finished [{id, name, ok, last}]
 
 Usage: <python> server.py [--port 8765]
 Then open http://127.0.0.1:8765 in Chrome or Edge (Firefox/Safari don't support the File System Access API).
@@ -19,7 +24,11 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import struct
+import subprocess
+import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -98,6 +107,67 @@ def list_fonts():
     return _fonts
 
 
+# Composites run one at a time from a queue; the editor polls GET /composite for progress.
+_job = {"running": False, "ok": None, "folder": None, "log": []}
+_queue = []       # [(script, folder)] waiting
+_finished = []    # [{id, name, ok, last}] newest last
+_worker = {"alive": False}
+_job_lock = threading.Lock()
+
+
+def find_clip_folder(video_name, size, roots):
+    """The folder under one of roots (up to 3 levels down) holding video_name at that byte size, or None.
+    The browser only gives the file's name, so the size tells same-named files apart."""
+    for root in roots:
+        for dirpath, dirs, files in os.walk(root):
+            if dirpath[len(root):].count(os.sep) >= 3:
+                dirs[:] = []
+            if video_name in files and os.path.getsize(os.path.join(dirpath, video_name)) == size:
+                return dirpath
+    return None
+
+
+def progress(log):
+    """0..1 from the compositor's "[step k/N]" lines, refined by the caption renderer's "frame a/b" lines."""
+    for i in range(len(log) - 1, -1, -1):
+        m = re.match(r"\[step (\d+)/(\d+)\]", log[i])
+        if m:
+            k, n = int(m.group(1)), int(m.group(2))
+            frames = [re.match(r"frame (\d+)/(\d+)", l) for l in log[i + 1:]]
+            frames = [f for f in frames if f]
+            frac = int(frames[-1].group(1)) / max(1, int(frames[-1].group(2))) if frames else 0
+            return min(1.0, (k - 1 + frac) / n)
+    return 0.0
+
+
+def composite_worker():
+    while True:
+        with _job_lock:
+            if not _queue:
+                _worker["alive"] = False
+                _job["running"] = False
+                return
+            script, folder = _queue.pop(0)
+            _job.update(running=True, ok=None, folder=folder, log=[])
+        run_composite(script, folder)
+        with _job_lock:
+            last = next((l for l in reversed(_job["log"]) if l.strip()), "")
+            _finished.append({"id": len(_finished) + 1, "name": os.path.basename(folder), "ok": _job["ok"], "last": last})
+
+
+def run_composite(script, folder):
+    proc = subprocess.Popen([sys.executable, script, folder], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace", env={**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"},
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    for line in proc.stdout:
+        _job["log"].append(line.rstrip())
+        del _job["log"][:-200]
+    _job["ok"] = proc.wait() == 0
+
+
+assert progress(["[step 3/6] captions", "frame 150/300"]) == 2.5 / 6 and progress([]) == 0.0
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -117,6 +187,12 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == "/settings":
             return self.send_json(load_settings())
+        if url.path == "/composite":
+            with _job_lock:
+                log = list(_job["log"])
+                state = {**_job, "log": log, "progress": 1.0 if _job["ok"] else progress(log),
+                         "queue": [os.path.basename(f) for _, f in _queue], "finished": _finished[-20:]}
+            return self.send_json(state)
         if url.path == "/fonts":
             return self.send_json(list_fonts())
         if url.path == "/fontfile":
@@ -148,6 +224,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == "/avatar":
             return self.save_avatar(parse_qs(url.query).get("name", [""])[0])
+        if url.path == "/composite":
+            return self.start_composite()
         if url.path != "/settings":
             return self.send_error(404)
         try:
@@ -169,6 +247,31 @@ class Handler(BaseHTTPRequestHandler):
             json.dump(merged, f, indent=2)
         os.replace(tmp, SETTINGS)
         self.send_json({"ok": True})
+
+    def start_composite(self):
+        try:
+            req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+            video, size = os.path.basename(str(req["video"])), int(req["size"])
+        except (ValueError, KeyError, TypeError):
+            return self.send_error(400, "video name and size needed")
+        cfg = load_settings()
+        script, roots = cfg.get("composite_script"), cfg.get("clip_roots") or []
+        if not script or not os.path.isfile(script) or not roots:
+            return self.send_json({"error": 'Set "composite_script" and "clip_roots" in settings.json first.'})
+        folder = find_clip_folder(video, size, roots)
+        if not folder:
+            return self.send_json({"error": f"Couldn't find {video} under the clip folders in settings.json."})
+        if os.path.splitext(video)[0] != os.path.basename(folder) or not os.path.isfile(os.path.join(folder, "captions.json")):
+            return self.send_json({"error": "The compositor needs <folder>/<folder>.mp4 next to captions.json."})
+        with _job_lock:
+            if (_job["running"] and _job["folder"] == folder) or any(f == folder for _, f in _queue):
+                return self.send_json({"error": f"{os.path.basename(folder)} is already compositing or queued."})
+            _queue.append((script, folder))
+            ahead = len(_queue) - 1 + (1 if _job["running"] else 0)
+            if not _worker["alive"]:
+                _worker["alive"] = True
+                threading.Thread(target=composite_worker, daemon=True).start()
+        self.send_json({"ok": True, "folder": folder, "ahead": ahead})
 
     def save_avatar(self, name):
         n = int(self.headers.get("Content-Length", 0))

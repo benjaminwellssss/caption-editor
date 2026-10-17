@@ -53,6 +53,8 @@
     <button id="undoBtn" title="Undo">↶</button>
     <button id="redoBtn" title="Redo">↷</button>
     <button id="saveBtn" class="primary">Save</button>
+    <button id="compositeBtn" title="Save, then build the finished _captioned.mp4 (zoom, captions, voice layer, handle pop-up, trims)">Ready for composite</button>
+    <button id="compositeProgress" class="composite-progress hidden" title="Show the compositor's output"><span class="fill"></span><span class="label"></span></button>
     <button id="backToSetupBtn" title="Load different files">Open…</button>
     <button id="helpBtn" class="round" title="Keys and controls">?</button>
   </header>
@@ -169,6 +171,16 @@
   <input id="gifSearch" type="text" placeholder="Search GIPHY…">
   <div id="gifGrid" class="gif-grid"></div>
   <p class="hint gif-credit">click to add to PROD NOTES · Powered by GIPHY</p>
+</div>
+
+<div id="logModal" class="modal hidden">
+  <div class="modal-box wide">
+    <div class="modal-header">
+      <span id="logTitle">Composite</span>
+      <button id="logModalClose" class="ghost">×</button>
+    </div>
+    <pre id="logBody" class="log-body"></pre>
+  </div>
 </div>
 
 <div id="helpModal" class="modal hidden">

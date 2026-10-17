@@ -247,6 +247,12 @@ input[type=range] { accent-color: var(--accent); }
 }
 .modal-box.small { width: 380px; }
 .modal-box.wide { width: 760px; }
+.composite-progress { position: relative; width: 190px; padding: 0; overflow: hidden; font-family: var(--mono); font-size: 12px; }
+.composite-progress .fill { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent-glow); transition: width .4s; }
+.composite-progress .label { position: relative; display: block; padding: 10px 12px; white-space: nowrap; }
+.composite-progress.failed .fill { background: #5a1d26; }
+.log-body { margin: 0 18px 18px; padding: 14px; height: 52vh; overflow: auto; background: #050708; color: var(--accent);
+  border-radius: 12px; font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-all; }
 .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; font-weight: 900; text-transform: uppercase; letter-spacing: .08em; }
 .speaker-form { padding: 6px 18px 18px; display: flex; flex-direction: column; gap: 12px; }
 .speaker-form label { display: flex; flex-direction: column; gap: 6px; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
