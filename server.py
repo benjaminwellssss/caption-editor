@@ -2,7 +2,7 @@
 
 All project file access (picking the video, cards.json, speakers.json, and saving back to them) happens
 client-side via the browser's File System Access API, which pops the real Windows "Open"/"Save As" dialogs.
-This server hands the browser the app's static files, plus three small helpers:
+This server hands the browser the app's static files, plus a few small helpers:
 
   GET/POST /settings   app-wide settings (speaker roster, favourite fonts) kept in settings.json next to
                        this file, so they survive closing the editor. settings.json is git-ignored.
@@ -13,8 +13,10 @@ This server hands the browser the app's static files, plus three small helpers:
   GET /avatars/X.png   serves one, for the editor's preview
   POST /composite      {video, size}: finds the clip folder holding that video (under settings.json
                        "clip_roots") and queues settings.json "composite_script" on it; queued clips run
-                       one after another in the background (one at a time: they share the GPU encoder)
-  GET /composite       the running one's state {running, ok, folder, log, progress 0..1}, plus
+                       one after another in the background (one at a time: they share the GPU encoder).
+                       The script runs under settings.json "composite_python" when set (the video-editor
+                       venv's python.exe), otherwise under this server's own interpreter.
+  GET /composite       the running one's state {running, ok, folder, log, step, progress 0..1}, plus
                        queue (clip names waiting) and finished [{id, name, ok, last}]
 
 Usage: <python> server.py [--port 8765]
@@ -108,11 +110,15 @@ def list_fonts():
 
 
 # Composites run one at a time from a queue; the editor polls GET /composite for progress.
-_job = {"running": False, "ok": None, "folder": None, "log": []}
-_queue = []       # [(script, folder)] waiting
+# step is the compositor's current "[step k/N] label" line plus the fraction of it done ("frame a/b" lines).
+_job = {"running": False, "ok": None, "folder": None, "log": [], "step": None}
+_queue = []       # [(python, script, folder)] waiting
 _finished = []    # [{id, name, ok, last}] newest last
 _worker = {"alive": False}
 _job_lock = threading.Lock()
+LOG_KEEP = 200    # lines of compositor output kept for the editor's log window
+STEP_RE = re.compile(r"\[step (\d+)/(\d+)\]\s*(.*)")
+FRAME_RE = re.compile(r"frame (\d+)/(\d+)")
 
 
 def find_clip_folder(video_name, size, roots):
@@ -127,17 +133,27 @@ def find_clip_folder(video_name, size, roots):
     return None
 
 
-def progress(log):
-    """0..1 from the compositor's "[step k/N]" lines, refined by the caption renderer's "frame a/b" lines."""
-    for i in range(len(log) - 1, -1, -1):
-        m = re.match(r"\[step (\d+)/(\d+)\]", log[i])
-        if m:
-            k, n = int(m.group(1)), int(m.group(2))
-            frames = [re.match(r"frame (\d+)/(\d+)", l) for l in log[i + 1:]]
-            frames = [f for f in frames if f]
-            frac = int(frames[-1].group(1)) / max(1, int(frames[-1].group(2))) if frames else 0
-            return min(1.0, (k - 1 + frac) / n)
-    return 0.0
+def note_line(line):
+    """Record one line of compositor output (caller holds _job_lock): the log window, and the progress the
+    line implies. Progress is tracked here rather than re-read from the log because one step prints far more
+    than LOG_KEEP lines (ffmpeg, the frame counter), which pushed the "[step k/N]" line out of the window."""
+    _job["log"].append(line)
+    del _job["log"][:-LOG_KEEP]
+    m = STEP_RE.match(line)
+    if m:
+        _job["step"] = {"k": int(m.group(1)), "n": int(m.group(2)), "label": m.group(3).strip(), "frac": 0.0}
+        return
+    m = FRAME_RE.match(line)
+    if m and _job["step"]:
+        _job["step"]["frac"] = min(1.0, int(m.group(1)) / max(1, int(m.group(2))))
+
+
+def progress(job):
+    """0..1: finished steps plus the fraction of the current one; 1.0 once the job succeeded."""
+    if job["ok"]:
+        return 1.0
+    s = job["step"]
+    return min(1.0, (s["k"] - 1 + s["frac"]) / s["n"]) if s and s["n"] else 0.0
 
 
 def composite_worker():
@@ -147,25 +163,29 @@ def composite_worker():
                 _worker["alive"] = False
                 _job["running"] = False
                 return
-            script, folder = _queue.pop(0)
-            _job.update(running=True, ok=None, folder=folder, log=[])
-        run_composite(script, folder)
+            python, script, folder = _queue.pop(0)
+            _job.update(running=True, ok=None, folder=folder, log=[], step=None)
+        try:
+            run_composite(python, script, folder)
+        except Exception as e:  # the interpreter or script couldn't be launched: report it instead of wedging the queue
+            with _job_lock:
+                note_line(f"Couldn't run the compositor ({python}): {e}")
+                _job["ok"] = False
         with _job_lock:
             last = next((l for l in reversed(_job["log"]) if l.strip()), "")
             _finished.append({"id": len(_finished) + 1, "name": os.path.basename(folder), "ok": _job["ok"], "last": last})
+            del _finished[:-50]
 
 
-def run_composite(script, folder):
-    proc = subprocess.Popen([sys.executable, script, folder], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+def run_composite(python, script, folder):
+    proc = subprocess.Popen([python, script, folder], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, encoding="utf-8", errors="replace", env={**os.environ, "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"},
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     for line in proc.stdout:
-        _job["log"].append(line.rstrip())
-        del _job["log"][:-200]
-    _job["ok"] = proc.wait() == 0
-
-
-assert progress(["[step 3/6] captions", "frame 150/300"]) == 2.5 / 6 and progress([]) == 0.0
+        with _job_lock:
+            note_line(line.rstrip())
+    with _job_lock:
+        _job["ok"] = proc.wait() == 0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -189,9 +209,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(load_settings())
         if url.path == "/composite":
             with _job_lock:
-                log = list(_job["log"])
-                state = {**_job, "log": log, "progress": 1.0 if _job["ok"] else progress(log),
-                         "queue": [os.path.basename(f) for _, f in _queue], "finished": _finished[-20:]}
+                state = {**_job, "log": list(_job["log"]), "step": dict(_job["step"]) if _job["step"] else None,
+                         "progress": progress(_job), "queue": [os.path.basename(f) for _, _, f in _queue],
+                         "finished": _finished[-20:]}
             return self.send_json(state)
         if url.path == "/fonts":
             return self.send_json(list_fonts())
@@ -265,15 +285,20 @@ class Handler(BaseHTTPRequestHandler):
         script, roots = cfg.get("composite_script"), cfg.get("clip_roots") or []
         if not script or not os.path.isfile(script) or not roots:
             return self.send_json({"error": 'Set "composite_script" and "clip_roots" in settings.json first.'})
+        # The compositor needs video-editor's dependencies, which only its venv has. This server may be running
+        # under plain "python" (the tray launcher falls back to it), so the venv's interpreter is configurable.
+        python = cfg.get("composite_python") or sys.executable
+        if cfg.get("composite_python") and not os.path.isfile(python):
+            return self.send_json({"error": f'"composite_python" in settings.json doesn\'t exist: {python}'})
         folder = find_clip_folder(video, size, roots)
         if not folder:
             return self.send_json({"error": f"Couldn't find {video} under the clip folders in settings.json."})
         if os.path.splitext(video)[0] != os.path.basename(folder) or not os.path.isfile(os.path.join(folder, "captions.json")):
             return self.send_json({"error": "The compositor needs <folder>/<folder>.mp4 next to captions.json."})
         with _job_lock:
-            if (_job["running"] and _job["folder"] == folder) or any(f == folder for _, f in _queue):
+            if (_job["running"] and _job["folder"] == folder) or any(f == folder for _, _, f in _queue):
                 return self.send_json({"error": f"{os.path.basename(folder)} is already compositing or queued."})
-            _queue.append((script, folder))
+            _queue.append((python, script, folder))
             ahead = len(_queue) - 1 + (1 if _job["running"] else 0)
             if not _worker["alive"]:
                 _worker["alive"] = True

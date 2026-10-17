@@ -2224,6 +2224,8 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     clearSelection();
     $("#lanesMenu").classList.add("hidden");
+    closeTlMenu();
+    closeFxPicker();
     if (state.trimSel) { state.trimSel = null; drawTrimLayer(); updateTrimBtn(); }
     return;
   }
@@ -2430,7 +2432,7 @@ $("#compositeBtn").addEventListener("click", async () => {
   if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
   btn.textContent = res.ahead ? `Queued (${res.ahead} ahead)` : "Started";
   setTimeout(() => { btn.textContent = "Ready for composite"; }, 2500);
-  if (!polling) pollComposite();
+  startPolling();
 });
 
 // The bar under the top bar's buttons; clicking it shows the compositor's output, live.
@@ -2445,8 +2447,13 @@ const scrollLog = () => { const el = $("#logBody"); el.scrollTop = el.scrollHeig
 let polling = false;
 let seenFinished = null;
 
-async function pollComposite() {
+function startPolling() { // one poll loop, however many times the button is pressed or the page reopened
+  if (polling) return;
   polling = true;
+  pollComposite();
+}
+
+async function pollComposite() {
   let job;
   try { job = await (await fetch("/composite")).json(); } catch { setTimeout(pollComposite, 3000); return; }
   if (seenFinished === null) seenFinished = job.finished.length ? job.finished[job.finished.length - 1].id : 0;
@@ -2456,13 +2463,12 @@ async function pollComposite() {
   }
   const queued = job.queue.length ? ` (+${job.queue.length} queued)` : "";
   const pct = Math.round(job.progress * 100);
-  const step = [...job.log].reverse().find((l) => l.startsWith("[step"));
   bar.classList.remove("hidden");
-  bar.classList.toggle("failed", !job.running && !job.ok);
+  bar.classList.toggle("failed", job.ok === false); // ok is null until a composite has finished
   bar.querySelector(".fill").style.width = pct + "%";
   bar.querySelector(".label").textContent = job.running
-    ? `${pct}% ${step ? step.replace(/^\[step \d+\/\d+\] /, "") : "starting"}…${queued}`
-    : job.ok ? "Composited ✓ (log)" : "Failed (see log)";
+    ? `${pct}% ${job.step ? job.step.label : "starting"}…${queued}`
+    : job.ok === true ? "Composited ✓ (log)" : job.ok === false ? "Failed (see log)" : `Starting…${queued}`;
   const atBottom = $("#logBody").scrollHeight - $("#logBody").scrollTop - $("#logBody").clientHeight < 40;
   $("#logBody").textContent = job.log.join("\n");
   $("#logTitle").textContent = "Composite: " + (job.folder || "").split(/[\\/]/).pop();
@@ -2485,7 +2491,7 @@ function notify(title, body) {
 // Reopening Cabtions mid-render picks the bar back up.
 fetch("/composite").then((r) => r.json()).then((job) => {
   seenFinished = job.finished.length ? job.finished[job.finished.length - 1].id : 0;
-  if (job.running || job.queue.length) pollComposite();
+  if (job.running || job.queue.length) startPolling();
 }).catch(() => {});
 
 window.addEventListener("beforeunload", (e) => {

@@ -130,6 +130,14 @@ The **Voice overlay** switch (on by default) adds a small avatar and name for ea
 bottom-left of the facecam; whoever has a caption on screen lights up in their colour. The preview shows
 it, and the renderer draws it.
 
+### Composite the finished video
+**Ready for composite** saves, then hands the clip to the video-editor compositor through the local server.
+Clips queue up and run one at a time; a progress bar appears in the top bar (click it for the compositor's
+live output) and Windows notifies you when each one finishes or fails. It needs three keys in `settings.json`
+next to `server.py`: `"composite_script"` (the path to video-editor's compositor script), `"clip_roots"`
+(a list of folders your clip folders live under) and, unless Cabtions itself runs from video-editor's venv,
+`"composite_python"` (that venv's `python.exe`, which has the compositor's dependencies).
+
 ### GIF search
 **GIF** on a caption row searches GIPHY (it starts with the caption's own words) and clicking a result adds
 its link to that caption's PROD NOTES. It needs a free GIPHY API key from developers.giphy.com, saved as
@@ -189,7 +197,8 @@ The speakers file (`<captions>_speakers.json`) holds
 "voice_overlay", "trims"?: [[start, end], ...]}`. A plain speakers
 array from an older version still opens.
 
-`settings.json` next to `server.py` keeps the speaker roster, pinned fonts and your GIPHY key between
-sessions. It's local to your machine and not tracked by git.
+`settings.json` next to `server.py` keeps the speaker roster, pinned fonts, the ♥ default font, your GIPHY
+key and the compositor settings (`composite_script`, `clip_roots`, `composite_python`) between sessions.
+It's local to your machine and not tracked by git.
 
 Only one Cabtions runs at a time: opening it again brings the existing window to the front.
