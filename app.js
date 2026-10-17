@@ -84,6 +84,17 @@ function speakerByName(name) {
   return state.speakers.find((s) => s.name === name);
 }
 
+// Speakers from a file or settings.json may be hand-edited: keep only usable entries, lower-case the hotkey
+// (the key handler compares lower-case), and make sure the colour is a #rrggbb the UI and hexToRgba can use.
+function normalizeSpeakers(list) {
+  const seen = new Set();
+  return list.filter((s) => s && typeof s === "object" && typeof s.name === "string" && s.name.trim()).map((s) => {
+    const sp = { ...s, name: s.name.trim(), key: String(s.key ?? "").trim().toLowerCase().slice(0, 1) };
+    if (!/^#[0-9a-f]{6}$/i.test(String(sp.color))) sp.color = "#8cff78";
+    return sp;
+  }).filter((s) => { if (seen.has(s.name)) return false; seen.add(s.name); return true; });
+}
+
 const laneOf = (card) => card.lane || 0;
 const setLane = (card, lane) => { if (lane) card.lane = lane; else delete card.lane; };
 const cardById = (id) => state.cards.find((c) => c._id === id);
@@ -105,6 +116,7 @@ let settingsTimer = null;
 
 async function loadSettings() {
   try { settings = await (await fetch("/settings")).json(); } catch { settings = {}; }
+  if (!settings || typeof settings !== "object") settings = {};
   state.favoriteFonts = Array.isArray(settings.favoriteFonts) ? settings.favoriteFonts : [];
 }
 
@@ -124,7 +136,7 @@ window.addEventListener("pagehide", () => {
   if (state.speakers.length) navigator.sendBeacon("/settings", new Blob([settingsPayload()], { type: "application/json" }));
 });
 
-loadSettings();
+const settingsReady = loadSettings(); // loadProject waits on this so a slow /settings can't lose the roster
 
 // ---------- editor text syntax ----------
 // The caption text box holds only what's displayed on screen:
@@ -150,7 +162,7 @@ const cardNotesText = (card) => card.note || "";
 function applyEditorText(card, raw) {
   const parsed = parseEditorText(raw);
   card.lines = parsed.lines;
-  if (parsed.note) card.note = parsed.note;
+  if (parsed.note) card.note = card.note && card.note !== parsed.note ? `${card.note}; ${parsed.note}` : parsed.note;
 }
 
 function applyNotesText(card, raw) {
@@ -303,6 +315,8 @@ async function loadProject() {
   let cards;
   try {
     cards = JSON.parse(await (await state.cardsHandle.getFile()).text());
+    if (!Array.isArray(cards)) throw new Error("expected a JSON list of caption cards");
+    cards.forEach((c, i) => { if (!c || typeof c !== "object" || typeof c.start !== "number" || typeof c.end !== "number") throw new Error(`card ${i + 1} has no start/end`); });
   } catch (e) {
     errEl.textContent = "Could not read cards.json: " + e.message;
     return;
@@ -320,8 +334,8 @@ async function loadProject() {
       // Old files are a plain speakers array; newer ones are {font, font_file?, speakers, lanes?}.
       if (Array.isArray(parsed)) {
         speakers = parsed;
-      } else {
-        speakers = parsed.speakers || [];
+      } else if (parsed && typeof parsed === "object") {
+        speakers = Array.isArray(parsed.speakers) ? parsed.speakers : [];
         if (parsed.font) font = parsed.font;
         if (parsed.font_file) fontFile = parsed.font_file;
         if (Array.isArray(parsed.lanes) && parsed.lanes.length) savedLanes = parsed.lanes;
@@ -333,9 +347,10 @@ async function loadProject() {
       return;
     }
   }
+  await settingsReady;
+  speakers = normalizeSpeakers(speakers);
   if (speakers.length === 0) {
-    speakers = (Array.isArray(settings.speakers) && settings.speakers.length ? settings.speakers : DEFAULT_SPEAKERS)
-      .map((s) => ({ ...s }));
+    speakers = normalizeSpeakers(Array.isArray(settings.speakers) && settings.speakers.length ? settings.speakers : DEFAULT_SPEAKERS);
   }
 
   if (!(await ensureReadWrite(state.cardsHandle))) {
@@ -345,8 +360,10 @@ async function loadProject() {
 
   let migrated = false;
   state.cards = cards.map((c) => {
-    const card = { ...c, _id: nextId++, lines: [...c.lines], speaker: c.speaker || null };
-    if (card.lane) card.lane = Math.max(0, Math.floor(card.lane)); else delete card.lane;
+    const lines = Array.isArray(c.lines) ? c.lines.map((l) => String(l ?? "")) : [String(c.text ?? "")];
+    const card = { ...c, _id: nextId++, lines, speaker: typeof c.speaker === "string" && c.speaker ? c.speaker : null };
+    if (card.end < card.start) [card.start, card.end] = [card.end, card.start];
+    if (!(card.lane > 0)) delete card.lane; else card.lane = Math.floor(card.lane);
     const before = JSON.stringify([card.lines, card.note || null]);
     applyEditorText(card, cardEditorText(card));
     if (JSON.stringify([card.lines, card.note || null]) !== before) migrated = true;
@@ -356,7 +373,8 @@ async function loadProject() {
 
   const maxLane = Math.max(0, ...state.cards.map(laneOf));
   if (savedLanes) {
-    state.lanes = savedLanes.map((l, i) => (typeof l === "string" ? { name: l, speaker: null } : { name: l.name || `Timeline ${i + 1}`, speaker: l.speaker || null }));
+    state.lanes = savedLanes.map((l, i) => (typeof l === "string" ? { name: l, speaker: null }
+      : { name: (l && l.name) || `Timeline ${i + 1}`, speaker: (l && typeof l.speaker === "string" && l.speaker) || null, ...(l && l.hidden ? { hidden: true } : {}) }));
   } else if (maxLane === 0) {
     organizeBySpeaker(); // first open of a fresh caption file: put each speaker on their own timeline
     migrated = true;
@@ -364,9 +382,10 @@ async function loadProject() {
     state.lanes = [];
   }
   while (state.lanes.length <= maxLane) state.lanes.push({ name: `Timeline ${state.lanes.length + 1}`, speaker: null });
+  if (state.lanes.every((l) => l.hidden)) delete state.lanes[0].hidden; // a hand-edited file can't hide every timeline
 
   sortCards();
-  state.activeLane = 0;
+  state.activeLane = Math.max(0, state.lanes.findIndex((l) => !l.hidden));
   state.font = font;
   state.fontFile = fontFile;
   state.trims = trims;
@@ -402,6 +421,7 @@ async function loadProject() {
 
 $("#backToSetupBtn").addEventListener("click", () => {
   if (state.dirty && !confirm("You have unsaved changes. Discard them and open different files?")) return;
+  video().pause();
   $("#editor").classList.add("hidden");
   $("#setup").classList.remove("hidden");
 });
@@ -414,10 +434,10 @@ video().addEventListener("loadedmetadata", () => renderTimeline());
 
 async function loadWaveform(file) {
   state.peaks = null;
+  let ctx = null;
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
     const audio = await ctx.decodeAudioData(await file.arrayBuffer());
-    ctx.close();
     const n = Math.ceil(audio.duration * PEAK_RATE);
     const peaks = new Float32Array(n);
     const per = audio.sampleRate / PEAK_RATE;
@@ -434,6 +454,8 @@ async function loadWaveform(file) {
     state.peaksMax = peaks.reduce((m, v) => Math.max(m, v), 0);
   } catch (e) {
     console.warn("waveform unavailable:", e);
+  } finally {
+    if (ctx) ctx.close().catch(() => {});
   }
   drawWaveform();
 }
@@ -476,7 +498,7 @@ function renderSpeakers() {
     const chip = document.createElement("div");
     chip.className = "speaker-chip";
     chip.innerHTML = `<span class="swatch" style="background:${sp.color};color:${sp.color}"></span>
-      <span class="key">${esc(sp.key.toUpperCase())}</span> ${esc(sp.name)}`;
+      <span class="key">${esc((sp.key || "?").toUpperCase())}</span> ${esc(sp.name)}`;
     chip.onclick = () => openSpeakerModal(idx);
     list.appendChild(chip);
   });
@@ -595,6 +617,20 @@ let fontPickTarget = null; // "video", or the speaker being edited
 
 const cssFamily = (family) => `"${family.replace(/"/g, "")}"`;
 
+// Is this family available to the browser? document.fonts.check() says yes for any name with no @font-face
+// (it only reports on loadable fonts), so measure instead: a family that falls back to both monospace and
+// serif renders the probe at both of their widths, which differ.
+const fontProbe = document.createElement("canvas").getContext("2d");
+const fontProbeCache = new Map();
+function fontInstalled(family) {
+  if (fontProbeCache.has(family)) return fontProbeCache.get(family);
+  const width = (font) => { fontProbe.font = `32px ${font}`; return fontProbe.measureText("mmmmmmmmmmlli1WWW").width; };
+  const fam = cssFamily(family);
+  const installed = width(`${fam}, monospace`) !== width("monospace") || width(`${fam}, serif`) !== width("serif");
+  fontProbeCache.set(family, installed);
+  return installed;
+}
+
 function renderFontButton() {
   const b = $("#fontPickerBtn");
   b.textContent = state.font + "  ▾";
@@ -602,15 +638,21 @@ function renderFontButton() {
 }
 
 function setFont(family, file) {
-  if (state.font === family && state.fontFile === (file || null)) return;
+  const fontFile = FONTS.includes(family) ? null : (file || null);
+  if (state.font === family && state.fontFile === fontFile) return;
   state.font = family;
-  state.fontFile = FONTS.includes(family) ? null : (file || null);
+  state.fontFile = fontFile;
   renderFontButton();
   markDirty(true);
 }
 
 async function getFontIndex() {
-  if (!fontIndex) fontIndex = await (await fetch("/fonts")).json().catch(() => []);
+  if (!fontIndex) {
+    try {
+      const list = await (await fetch("/fonts")).json();
+      fontIndex = Array.isArray(list) ? list : [];
+    } catch { fontIndex = []; }
+  }
   return fontIndex;
 }
 
@@ -642,7 +684,7 @@ const faceObserver = new IntersectionObserver((entries) => {
     const f = fontIndex[+i];
     const sample = en.target.querySelector(".fsample");
     sample.style.fontFamily = `${cssFamily(f.family)}, var(--sans)`;
-    if (!document.fonts.check(`16px ${cssFamily(f.family)}`)) { // not installed (a font_dirs file): load it
+    if (!fontInstalled(f.family)) { // not installed (a font_dirs file): load it
       new FontFace(`cabpv${i}`, `url(/fontfile?i=${i})`).load()
         .then((face) => { document.fonts.add(face); sample.style.fontFamily = `cabpv${i}`; }).catch(() => {});
     }
@@ -1092,6 +1134,7 @@ document.addEventListener("click", (e) => {
 
 let gifTarget = null;
 let gifTimer = null;
+let gifSeq = 0; // a slow earlier search must not overwrite the results of a later one
 
 function openGifPicker(notesInput, card, anchor) {
   gifTarget = notesInput;
@@ -1102,7 +1145,7 @@ function openGifPicker(notesInput, card, anchor) {
   pop.style.left = clamp(r.right - pop.offsetWidth, 8, window.innerWidth - pop.offsetWidth - 8) + "px";
   pop.style.top = (r.bottom + pop.offsetHeight + 8 < window.innerHeight ? r.bottom + 6 : Math.max(8, r.top - pop.offsetHeight - 6)) + "px";
   const q = $("#gifSearch");
-  if (!q.value) q.value = card.lines.join(" ").toLowerCase();
+  q.value = card.lines.join(" ").toLowerCase();
   q.focus();
   q.select();
   searchGifs();
@@ -1120,10 +1163,12 @@ async function searchGifs() {
     ? `https://api.giphy.com/v1/gifs/search?api_key=${encodeURIComponent(key)}&q=${encodeURIComponent(q)}&limit=30&rating=pg-13`
     : `https://api.giphy.com/v1/gifs/trending?api_key=${encodeURIComponent(key)}&limit=30&rating=pg-13`;
   grid.innerHTML = `<p class="hint">Searching…</p>`;
+  const seq = ++gifSeq;
   try {
     const res = await fetch(url);
     if (!res.ok) throw new Error(`GIPHY said ${res.status}`);
     const data = (await res.json()).data || [];
+    if (seq !== gifSeq) return;
     if (!data.length) { grid.innerHTML = `<p class="hint">Nothing for “${esc(q)}”.</p>`; return; }
     grid.innerHTML = data.map((g, i) => {
       const prev = g.images.fixed_height_small || g.images.fixed_height;
@@ -1134,7 +1179,7 @@ async function searchGifs() {
       insertGifLink((g.images.downsized_medium || g.images.original).url.split("?")[0]);
     }));
   } catch (e) {
-    grid.innerHTML = `<p class="error">GIF search failed: ${esc(e.message)}</p>`;
+    if (seq === gifSeq) grid.innerHTML = `<p class="error">GIF search failed: ${esc(e.message)}</p>`;
   }
 }
 
@@ -1882,7 +1927,7 @@ function undoLast() {
   a.undo();
   state.redoStack.push(a);
   if (state.redoStack.length > MAX_HISTORY) state.redoStack.shift();
-  markDirty(state.undoStack.length > 0 || state.dirty);
+  markDirty(true); // undoing changes what's in memory vs. the saved files, whichever way the stack now looks
   updateHistoryButtons();
 }
 
@@ -2025,7 +2070,10 @@ function updateOverlay() {
     const card = currentCardInLane(t, lane);
     if (card && t <= card.end + 0.4 && card.lines.join("").trim()) active.push(card);
   }
-  const key = active.map((c) => c._id + ":" + c.lines.join("|") + ":" + c.speaker).join(",") + state.font;
+  const key = active.map((c) => {
+    const sp = c.speaker ? speakerByName(c.speaker) : null;
+    return c._id + ":" + c.lines.join("|") + ":" + c.speaker + ":" + (sp ? sp.color + sp.font : "");
+  }).join(",") + state.font;
   if (overlay.dataset.key !== key) {
     overlay.dataset.key = key;
     overlay.innerHTML = active.map((c, i) => {

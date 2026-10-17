@@ -21,7 +21,7 @@ import mimetypes
 import os
 import struct
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 STATIC_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_FILES = {"/": "index.html", "/app.js": "app.js", "/style.css": "style.css",
@@ -122,19 +122,21 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/fontfile":
             try:
                 path = list_fonts()[int(parse_qs(url.query)["i"][0])]["file"]
-            except (KeyError, ValueError, IndexError):
+                with open(path, "rb") as f:
+                    data = f.read()
+            except (KeyError, ValueError, IndexError, OSError):  # bad index, or the font file has gone
                 return self.send_error(404)
-            with open(path, "rb") as f:
-                return self.send_bytes(f.read(), "font/ttf")
+            return self.send_bytes(data, "font/otf" if path.lower().endswith(".otf") else "font/ttf")
         if url.path.startswith("/avatars/"):
-            path = os.path.normpath(os.path.join(STATIC_DIR, url.path.lstrip("/")))
-            if not path.startswith(AVATAR_DIR) or not os.path.isfile(path):
+            # the browser percent-encodes the file name ("Ben%20W.png"), so decode before touching the disk
+            path = os.path.normpath(os.path.join(STATIC_DIR, unquote(url.path).lstrip("/")))
+            if not path.startswith(AVATAR_DIR + os.sep) or not os.path.isfile(path):
                 return self.send_error(404)
             with open(path, "rb") as f:
                 return self.send_bytes(f.read(), "image/png")
         if url.path.startswith("/assets/"):
-            path = os.path.normpath(os.path.join(STATIC_DIR, url.path.lstrip("/")))
-            if not path.startswith(ASSET_DIR) or not os.path.isfile(path):  # no escaping the assets folder
+            path = os.path.normpath(os.path.join(STATIC_DIR, unquote(url.path).lstrip("/")))
+            if not path.startswith(ASSET_DIR + os.sep) or not os.path.isfile(path):  # no escaping the assets folder
                 return self.send_error(404)
         else:
             rel = STATIC_FILES.get(url.path)
@@ -157,10 +159,15 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self.send_error(400, str(e))
         old = load_settings()
+        if not isinstance(old, dict):  # a hand-edited settings.json that isn't an object
+            old = {}
         merged = {**old, **data}  # a partial update never wipes other keys (e.g. giphy_key)
         # an editor window running older code saves its roster without handles/pictures - keep them
-        prev = {sp.get("name"): sp for sp in old.get("speakers", []) if isinstance(sp, dict)}
-        for sp in merged.get("speakers", []):
+        def speakers(d):
+            lst = d.get("speakers")
+            return [sp for sp in lst if isinstance(sp, dict)] if isinstance(lst, list) else []
+        prev = {sp.get("name"): sp for sp in speakers(old)}
+        for sp in speakers(merged):
             for k in ("handle", "avatar", "font", "font_file"):
                 if k not in sp and k in prev.get(sp.get("name"), {}):
                     sp[k] = prev[sp["name"]][k]
@@ -171,7 +178,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
     def save_avatar(self, name):
-        n = int(self.headers.get("Content-Length", 0))
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            n = 0
         if not 0 < n <= 15_000_000:
             return self.send_error(400, "picture missing or too big")
         try:
