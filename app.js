@@ -511,6 +511,7 @@ function blurFocused() {
   // A display:none ancestor doesn't auto-blur a focused input in every browser - left focused,
   // isTypingTarget() would keep swallowing every hotkey.
   if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
+  updateDoneTyping(); // focusout doesn't always fire while the window is in the background
 }
 
 function closeSpeakerModal() {
@@ -924,6 +925,7 @@ function buildRow(card) {
   };
   const emojiBtn = iconBtn("😀", "Insert emoji", (b) => openEmojiPicker(b, text));
   const gifBtn = iconBtn("GIF", "Search GIPHY and put a GIF link in this caption's PROD NOTES", (b) => openGifPicker(notes, card, b), "gif-btn");
+  const fxBtn = iconBtn("FX", "Add a text-effect preset to this caption's PROD NOTES", (b) => openFxPicker(notes, b), "gif-btn fx-btn");
   const insertBtn = iconBtn("+", "Add a blank caption after this one", () => insertCardAfter(id));
   const deleteBtn = iconBtn("✕", "Delete this caption", () => deleteCards([id]), "danger");
 
@@ -931,7 +933,7 @@ function buildRow(card) {
   notesArea.className = "notes-area";
   notesArea.append(notesLabel, notes);
 
-  row.append(handle, seekBtn, startInput, sep, endInput, text, notesArea, noteChip, badge, laneSel, emojiBtn, gifBtn, insertBtn, deleteBtn);
+  row.append(handle, seekBtn, startInput, sep, endInput, text, notesArea, noteChip, badge, laneSel, emojiBtn, gifBtn, fxBtn, insertBtn, deleteBtn);
   updateNoteChip(row, card);
   updateBadge(row, card);
   return row;
@@ -994,6 +996,7 @@ function addCard(card, focus = true) {
     const row = rowOf(card._id);
     if (row) row.querySelector(".text").focus({ preventScroll: true });
   }
+  return card;
 }
 
 // Room before the next caption *on the same timeline*, so a new caption doesn't land on a neighbour.
@@ -1008,13 +1011,13 @@ function blankCardAt(t, lane) {
   return { start: t, end, lines: [""], speaker: sp || null, ...(lane ? { lane } : {}) };
 }
 
-function insertCardAfter(id) {
+function insertCardAfter(id, focus = true) {
   const card = cardById(id);
-  addCard(blankCardAt(card.end, laneOf(card)));
+  return addCard(blankCardAt(card.end, laneOf(card)), focus);
 }
 
-function insertCardAtTime(t, lane = state.activeLane) {
-  addCard(blankCardAt(Math.round(t * FPS) / FPS, lane));
+function insertCardAtTime(t, lane = state.activeLane, focus = true) {
+  return addCard(blankCardAt(Math.round(t * FPS) / FPS, lane), focus);
 }
 
 function deleteCards(ids) {
@@ -1096,11 +1099,7 @@ let gifTimer = null;
 function openGifPicker(notesInput, card, anchor) {
   gifTarget = notesInput;
   $("#gifModalTitle").textContent = `GIF for “${card.lines.join(" ") || "blank caption"}”`;
-  const pop = $("#gifPop");
-  pop.classList.remove("hidden");
-  const r = anchor.getBoundingClientRect();
-  pop.style.left = clamp(r.right - pop.offsetWidth, 8, window.innerWidth - pop.offsetWidth - 8) + "px";
-  pop.style.top = (r.bottom + pop.offsetHeight + 8 < window.innerHeight ? r.bottom + 6 : Math.max(8, r.top - pop.offsetHeight - 6)) + "px";
+  placePop($("#gifPop"), anchor.getBoundingClientRect());
   const q = $("#gifSearch");
   if (!q.value) q.value = card.lines.join(" ").toLowerCase();
   q.focus();
@@ -1157,6 +1156,162 @@ document.addEventListener("mousedown", (e) => {
 $("#gifSearch").addEventListener("input", () => { clearTimeout(gifTimer); gifTimer = setTimeout(searchGifs, 350); });
 $("#gifModalClose").addEventListener("click", closeGifPicker);
 $("#gifSearch").addEventListener("keydown", (e) => { if (e.key === "Escape") closeGifPicker(); });
+
+// Shows a floating window just under (or above) the rect it belongs to, kept on screen.
+function placePop(pop, r) {
+  pop.classList.remove("hidden");
+  pop.style.left = clamp(r.right - pop.offsetWidth, 8, window.innerWidth - pop.offsetWidth - 8) + "px";
+  pop.style.top = (r.bottom + pop.offsetHeight + 8 < window.innerHeight ? r.bottom + 6 : Math.max(8, r.top - pop.offsetHeight - 6)) + "px";
+}
+
+// ---------- FX presets ----------
+// Each preset is only PROD NOTES wording that the renderer (caption_fx.py) already understands, so a preset
+// can be edited by hand afterwards like any note. "Used before" are notes from past clips.
+const FX_PRESETS = [
+  ["Used before", [
+    ["Echo", "echoy text moving effect"], ["Big + shaky", "make this text big and shaky"],
+    ["Spooky", "spooky shake, purple, echo"], ["Rage", "red, angry violent growing shake"],
+    ["Rage build", "red, angry shaking, progressively more violent"], ["MAX RAGE", "red, maximum shake and zoom"],
+    ["Sad", "blue, gentle shaking sad text"], ["Nervous", "gentle grow and vibrate"],
+    ["Holy", "holy light shine, brief and dramatic"], ["Neon", "glowing green neon"],
+    ["Clone army", "multiplying text that gradually turns red and shakes intensely"], ["Little dance", "little subtle dance"],
+  ]],
+  ["Sly / quiet", [
+    ["Sly", "sly lean, slow slide, purple"], ["Sneaky", "sneaky lean, fade in, slide"],
+    ["Sarcastic", "sarcastic lean, yellow"], ["Whisper", "whisper fade in, gentle vibrate"],
+    ["Ghost", "white, fade in, echo"], ["Drunk", "slow wiggle, echo, lean"],
+  ]],
+  ["Medieval", [
+    ["Medieval", "medieval font"], ["Royal decree", "medieval font, yellow, holy glow"],
+    ["Dark lord", "medieval font, red, slow grow, gentle shake"],
+  ]],
+  ["Punch / mood", [
+    ["Impact", "impact"], ["Slam", "slam, hard"], ["Hype", "yellow, very bounce, zoom"],
+    ["Panic", "orange, violent vibrate"], ["Cursed", "purple, echo, vibrate"], ["Toxic", "green, wiggle, glow"],
+    ["Frozen", "cyan, gentle vibrate, slow grow"], ["Love", "pink, gentle grow, glow"], ["Groove", "pink groove"],
+  ]],
+];
+
+let fxTarget = null;
+
+$("#fxGrid").innerHTML = FX_PRESETS.map(([group, items]) => `<div class="fx-group">${esc(group)}</div>` +
+  items.map(([name, note]) => `<button class="fx-item" data-note="${esc(note)}" title="${esc(note)}">${esc(name)}</button>`).join("")).join("");
+
+function openFxPicker(notesInput, anchor) {
+  fxTarget = notesInput;
+  placePop($("#fxPop"), anchor.getBoundingClientRect());
+}
+
+function closeFxPicker() {
+  $("#fxPop").classList.add("hidden");
+  fxTarget = null;
+}
+
+$("#fxGrid").addEventListener("click", (e) => {
+  const b = e.target.closest(".fx-item");
+  if (!b || !fxTarget) return;
+  const cur = fxTarget.value.trim();
+  fxTarget.value = cur ? `${cur}, ${b.dataset.note}` : b.dataset.note;
+  fxTarget.dispatchEvent(new Event("change", { bubbles: true })); // a row's notes field pushes its own undo
+  closeFxPicker();
+});
+$("#fxModalClose").addEventListener("click", closeFxPicker);
+
+// ---------- timeline right-click menu + quick edit ----------
+function openTlMenu(e, items) {
+  e.preventDefault();
+  hideBlockTip();
+  const m = $("#tlMenu");
+  m.innerHTML = "";
+  for (const [label, fn] of items) {
+    const it = document.createElement("div");
+    it.className = "menu-item";
+    it.textContent = label;
+    it.addEventListener("click", () => { closeTlMenu(); fn(); });
+    m.appendChild(it);
+  }
+  m.classList.remove("hidden");
+  m.style.left = clamp(e.clientX, 8, window.innerWidth - m.offsetWidth - 8) + "px";
+  m.style.top = clamp(e.clientY, 8, window.innerHeight - m.offsetHeight - 8) + "px";
+}
+
+const closeTlMenu = () => $("#tlMenu").classList.add("hidden");
+
+function blockMenu(e, id) {
+  const card = cardById(id);
+  const ids = state.selection.has(id) ? [...state.selection] : [id];
+  openTlMenu(e, [
+    ["✎ Quick edit", () => openQuickEdit(card)],
+    ["FX preset…", () => { openQuickEdit(card); openFxPicker($("#qeNotes"), $("#qeFxBtn")); }],
+    ["+ Add caption after", () => openQuickEdit(insertCardAfter(id, false))],
+    ["▶ Jump here", () => { video().currentTime = card.start; }],
+    [ids.length > 1 ? `✕ Delete ${ids.length} captions` : "✕ Delete", () => deleteCards(ids)],
+  ]);
+}
+
+let qeCard = null;
+
+function openQuickEdit(card) {
+  qeCard = card;
+  $("#qeTitle").textContent = `Quick edit · ${fmtTime(card.start)}`;
+  $("#qeText").value = cardEditorText(card);
+  $("#qeNotes").value = cardNotesText(card);
+  const block = $(`.tl-block[data-id="${card._id}"]`);
+  placePop($("#quickEdit"), (block || $("#tlScroll")).getBoundingClientRect());
+  $("#qeText").focus();
+  $("#qeText").select();
+}
+
+// Writes through the caption's list row, so undo, the note chip and the timeline block update exactly as typing there would.
+function saveQuickEdit() {
+  if (!qeCard) return;
+  const values = { ".text": $("#qeText").value, ".notes": $("#qeNotes").value };
+  const row = rowOf(qeCard._id);
+  closeQuickEdit();
+  if (!row) return;
+  for (const [sel, v] of Object.entries(values)) {
+    const el = row.querySelector(sel);
+    if (el.value !== v) { el.value = v; el.dispatchEvent(new Event("change")); }
+  }
+}
+
+function closeQuickEdit() {
+  $("#quickEdit").classList.add("hidden");
+  qeCard = null;
+  blurFocused();
+}
+
+$("#quickEdit").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); saveQuickEdit(); } // else Enter also rewinds the video
+  else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeQuickEdit(); }
+});
+$("#qeSave").addEventListener("click", saveQuickEdit);
+$("#qeClose").addEventListener("click", closeQuickEdit);
+$("#qeFxBtn").addEventListener("click", (e) => openFxPicker($("#qeNotes"), e.currentTarget));
+
+document.addEventListener("mousedown", (e) => {
+  if (!$("#tlMenu").classList.contains("hidden") && !e.target.closest("#tlMenu")) closeTlMenu();
+  if (!$("#fxPop").classList.contains("hidden") && !e.target.closest("#fxPop, .fx-btn")) closeFxPicker();
+  // a click elsewhere keeps what was typed, the same way leaving a list row's box does
+  if (qeCard && !e.target.closest("#quickEdit, #fxPop, #tlMenu")) saveQuickEdit();
+});
+
+// ---------- getting out of a text box ----------
+// The timeline cancels mousedown (for dragging), so clicking it never took focus away from a caption box and
+// every hotkey kept typing into it. Any click outside a text box now leaves it; so do Esc, Enter and the button.
+document.addEventListener("mousedown", (e) => {
+  if (isTypingTarget(document.activeElement) && !isTypingTarget(e.target)
+      && !e.target.closest(".modal, .gif-pop, .emoji-picker, #doneTypingBtn")) blurFocused();
+}, true);
+
+function updateDoneTyping() {
+  $("#doneTypingBtn").classList.toggle("hidden", !isTypingTarget(document.activeElement));
+}
+document.addEventListener("focusin", updateDoneTyping);
+document.addEventListener("focusout", () => setTimeout(updateDoneTyping));
+// blur on click, not mousedown: hiding the button mid-click would land the click on whatever slides under it
+$("#doneTypingBtn").addEventListener("mousedown", (e) => e.preventDefault());
+$("#doneTypingBtn").addEventListener("click", blurFocused);
 
 // ---------- selection (shared by the list and the timeline) ----------
 
@@ -1369,6 +1524,14 @@ function renderTimeline() {
       if (e.target !== track) return;
       insertCardAtTime((e.clientX - track.getBoundingClientRect().left) / state.pps, lane);
     });
+    track.addEventListener("contextmenu", (e) => {
+      if (e.target !== track) return;
+      const t = (e.clientX - track.getBoundingClientRect().left) / state.pps;
+      openTlMenu(e, [
+        ["+ Add caption here", () => openQuickEdit(insertCardAtTime(t, lane, false))],
+        ["▶ Move playhead here", () => { video().currentTime = t; }],
+      ]);
+    });
     state.cards.forEach((card) => { if (Math.min(laneOf(card), laneCount() - 1) === lane) track.appendChild(makeBlock(card)); });
     const color = laneColor(ln);
     const label = row(`<span class="dot" style="background:${color};color:${color}"></span>${esc(ln.name)}`,
@@ -1413,6 +1576,8 @@ function makeBlock(card) {
   b.addEventListener("mousedown", (e) => { hideBlockTip(); onBlockMouseDown(e, card._id); });
   b.addEventListener("mouseenter", () => { if (!tlDrag && !marquee) showBlockTip(b, card._id); });
   b.addEventListener("mouseleave", hideBlockTip);
+  b.addEventListener("contextmenu", (e) => blockMenu(e, card._id));
+  b.addEventListener("dblclick", () => openQuickEdit(cardById(card._id)));
   positionBlock(b, card);
   return b;
 }
@@ -1975,6 +2140,12 @@ document.addEventListener("keydown", (e) => {
   if ($("#editor").classList.contains("hidden")) return;
   const modal = openModal();
   if (e.key === "Escape" && modal && modal.id !== "speakerModal") { modal.classList.add("hidden"); blurFocused(); return; }
+  if (!modal && isTypingTarget(document.activeElement)
+      && (e.key === "Escape" || (e.key === "Enter" && document.activeElement.closest(".word-row")))) {
+    e.preventDefault();
+    blurFocused(); // leave the box; a row's change handler commits the edit on blur
+    return;
+  }
   if (isTypingTarget(document.activeElement) || modal) return;
 
   const v = video();

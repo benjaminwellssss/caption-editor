@@ -318,6 +318,16 @@ input[type=range] { accent-color: var(--accent); }
 .gif-pop .gif-item { height: 84px; }
 
 .word-row .gif-btn { font-size: 10px; font-weight: 900; letter-spacing: .02em; width: 36px; }
+
+.fx-pop { width: 380px; z-index: 80; } /* above quick edit, which opens it */
+.fx-grid { overflow-y: auto; display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 2px; }
+.fx-group { grid-column: 1 / -1; font: 11px var(--mono); color: var(--faint); text-transform: uppercase; letter-spacing: .08em; margin-top: 4px; }
+.fx-item { font-size: 12px; padding: 7px 6px; text-transform: none; }
+.tl-menu { position: fixed; right: auto; top: 0; z-index: 75; }
+.quick-edit { width: 360px; }
+.qe-notes-row, .qe-actions { display: flex; gap: 8px; align-items: center; }
+.qe-notes-row input { flex: 1; min-width: 0; }
+.qe-actions { justify-content: space-between; }
 .gif-grid { overflow-y: auto; display: grid; gap: 6px; }
 .gif-item { padding: 0; border-radius: 10px; overflow: hidden; height: 110px; background: #101214; }
 .gif-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
