@@ -118,10 +118,12 @@ async function loadSettings() {
   try { settings = await (await fetch("/settings")).json(); } catch { settings = {}; }
   if (!settings || typeof settings !== "object") settings = {};
   state.favoriteFonts = Array.isArray(settings.favoriteFonts) ? settings.favoriteFonts : [];
+  const d = settings.defaultFont;
+  state.defaultFont = d && typeof d.family === "string" && d.family ? { family: d.family, file: d.file || null } : null;
 }
 
 function settingsPayload() {
-  return JSON.stringify({ speakers: state.speakers, favoriteFonts: state.favoriteFonts });
+  return JSON.stringify({ speakers: state.speakers, favoriteFonts: state.favoriteFonts, defaultFont: state.defaultFont });
 }
 
 function saveSettingsSoon() {
@@ -323,7 +325,7 @@ async function loadProject() {
   }
 
   let speakers = [];
-  let font = DEFAULT_FONT;
+  let font = null; // the video's own saved font wins; otherwise the ♥ default (below), then DEFAULT_FONT
   let fontFile = null;
   let savedLanes = null;
   let trims = [];
@@ -348,6 +350,10 @@ async function loadProject() {
     }
   }
   await settingsReady;
+  if (!font) {
+    font = state.defaultFont ? state.defaultFont.family : DEFAULT_FONT;
+    fontFile = state.defaultFont && !FONTS.includes(font) ? state.defaultFont.file : null;
+  }
   speakers = normalizeSpeakers(speakers);
   if (speakers.length === 0) {
     speakers = normalizeSpeakers(Array.isArray(settings.speakers) && settings.speakers.length ? settings.speakers : DEFAULT_SPEAKERS);
@@ -660,8 +666,8 @@ async function getFontIndex() {
 async function openFontBrowser(target) {
   fontPickTarget = target;
   $("#fontModalHint").textContent = target === "video"
-    ? "Click a font to use it for this video. ★ pins it to the top of the list."
-    : `Click a font for ${$("#spName").value || "this speaker"}'s captions. ★ pins it to the top of the list.`;
+    ? "Click a font to use it for this video. ★ pins it to the top of the list. ♥ makes it the default for every video (and uses it here)."
+    : `Click a font for ${$("#spName").value || "this speaker"}'s captions. ★ pins it to the top of the list. ♥ makes it the default video font.`;
   $("#fontModal").classList.remove("hidden");
   $("#fontSearch").value = "";
   $("#fontSearch").focus();
@@ -704,10 +710,12 @@ function renderFontList() {
   });
   rows.sort((a, b) => b.fav - a.fav); // pinned first, then alphabetical (the server sorts)
   const current = fontPickTarget === "video" ? state.font : pendingSpeakerFont.family;
+  const defaultFamily = state.defaultFont ? state.defaultFont.family : null;
   const shown = rows.slice(0, 600);
   const list = $("#fontList");
   list.innerHTML = shown.map((f) => `<div class="font-item${f.family === current ? " current" : ""}" data-i="${f.i}">
       <span class="star${f.fav ? " on" : ""}" title="Pin to the top">${f.fav ? "★" : "☆"}</span>
+      <span class="heart${f.family === defaultFamily ? " on" : ""}" title="Default font: every video without its own font opens in this one">${f.family === defaultFamily ? "♥" : "♡"}</span>
       <span class="fname">${esc(f.family)}</span><span class="fsample">${sample}</span></div>`).join("")
     + (rows.length > shown.length ? `<p class="hint">${rows.length - shown.length} more: type to narrow down</p>` : "");
   list.querySelectorAll(".font-item").forEach((el) => {
@@ -717,6 +725,14 @@ function renderFontList() {
       e.stopPropagation();
       const k = state.favoriteFonts.findIndex((x) => x.family === f.family);
       if (k >= 0) state.favoriteFonts.splice(k, 1); else state.favoriteFonts.push({ family: f.family, file: f.file });
+      saveSettingsSoon();
+      renderFontList();
+    });
+    el.querySelector(".heart").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const was = state.defaultFont && state.defaultFont.family === f.family;
+      state.defaultFont = was ? null : { family: f.family, file: f.file };
+      if (!was && fontPickTarget === "video") setFont(f.family, f.file);
       saveSettingsSoon();
       renderFontList();
     });

@@ -273,6 +273,8 @@ input[type=range] { accent-color: var(--accent); }
 .font-item.current { box-shadow: inset 0 0 0 1px var(--accent-dim); }
 .font-item .star { font-size: 18px; width: 26px; text-align: center; color: var(--faint); cursor: pointer; }
 .font-item .star.on { color: var(--accent); text-shadow: 0 0 8px var(--accent-glow); }
+.font-item .heart { font-size: 18px; width: 22px; text-align: center; color: var(--faint); cursor: pointer; }
+.font-item .heart.on { color: #ff5c8a; text-shadow: 0 0 8px rgba(255, 92, 138, .55); }
 .font-item .fname { width: 200px; flex-shrink: 0; font: 12px var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .font-item .fsample { flex: 1; font-size: 24px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
