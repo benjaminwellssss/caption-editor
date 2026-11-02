@@ -234,6 +234,16 @@ async function pickFile(target) {
     // default folder (passing a file handle as startIn opens the folder that file is in)
     const startIn = target !== "video" && state.videoHandle ? state.videoHandle : startDir || "videos";
     const [handle] = await window.showOpenFilePicker({ types, multiple: false, startIn });
+    // Save writes the sidecar straight after the cards, so one file in both slots would lose the captions.
+    const other = target === "cards" ? state.speakersHandle : target === "speakers" ? state.cardsHandle : null;
+    if (other && (await handle.isSameEntry(other))) {
+      alert(`${handle.name} can't be both the captions file and the speakers file, so the speakers file was cleared. Leave it empty and Save will offer to create one.`);
+      state.speakersHandle = null;
+      const speakersLabel = $("#speakersPathLabel");
+      speakersLabel.textContent = "none: made on first save";
+      speakersLabel.classList.remove("chosen");
+      if (target === "speakers") return;
+    }
     if (target === "video") state.videoHandle = handle;
     else if (target === "cards") state.cardsHandle = handle;
     else state.speakersHandle = handle;
@@ -330,6 +340,7 @@ async function loadProject() {
   let savedLanes = null;
   let trims = [];
   let voiceOverlay = true;
+  let sidecarExtra = {}; // keys this editor doesn't edit (e.g. "layout"), written back untouched on save
   if (state.speakersHandle) {
     try {
       const parsed = JSON.parse(await (await state.speakersHandle.getFile()).text());
@@ -343,6 +354,7 @@ async function loadProject() {
         if (Array.isArray(parsed.lanes) && parsed.lanes.length) savedLanes = parsed.lanes;
         if (Array.isArray(parsed.trims)) trims = parsed.trims.filter((r) => Array.isArray(r) && r[1] > r[0]);
         if (parsed.voice_overlay === false) voiceOverlay = false;
+        sidecarExtra = parsed;
       }
     } catch (e) {
       errEl.textContent = "Could not read speakers.json: " + e.message;
@@ -395,6 +407,7 @@ async function loadProject() {
   state.font = font;
   state.fontFile = fontFile;
   state.trims = trims;
+  state.sidecarExtra = sidecarExtra;
   state.trimSel = null;
   state.voiceOverlay = voiceOverlay;
   $("#voiceToggle").checked = voiceOverlay;
@@ -907,6 +920,12 @@ function buildRow(card) {
   text.value = cardEditorText(card);
   text.title = "What's shown in the video.   |  = line break";
   text.addEventListener("click", (e) => e.stopPropagation());
+  text.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || !e.ctrlKey) return;
+    e.preventDefault();
+    e.stopPropagation(); // else Enter also leaves the box
+    splitCard(id, text.value, text.selectionStart);
+  });
   text.addEventListener("change", () => {
     const prev = cardEditorText(card);
     const next = text.value;
@@ -984,6 +1003,10 @@ function buildRow(card) {
   const emojiBtn = iconBtn("😀", "Insert emoji", (b) => openEmojiPicker(b, text));
   const gifBtn = iconBtn("GIF", "Search GIPHY and put a GIF link in this caption's PROD NOTES", (b) => openGifPicker(notes, card, b), "gif-btn");
   const fxBtn = iconBtn("FX", "Add a text-effect preset to this caption's PROD NOTES", (b) => openFxPicker(notes, b), "gif-btn fx-btn");
+  const splitBtn = iconBtn("✂", "Split into two captions at the cursor in the text box (Ctrl + Enter)", () => {
+    if (!splitCard(id, text.value, text.selectionStart)) text.focus();
+  });
+  splitBtn.addEventListener("mousedown", (e) => e.preventDefault()); // keep the cursor in the text box
   const insertBtn = iconBtn("+", "Add a blank caption after this one", () => insertCardAfter(id));
   const deleteBtn = iconBtn("✕", "Delete this caption", () => deleteCards([id]), "danger");
 
@@ -991,7 +1014,7 @@ function buildRow(card) {
   notesArea.className = "notes-area";
   notesArea.append(notesLabel, notes);
 
-  row.append(handle, seekBtn, startInput, sep, endInput, text, notesArea, noteChip, badge, laneSel, emojiBtn, gifBtn, fxBtn, insertBtn, deleteBtn);
+  row.append(handle, seekBtn, startInput, sep, endInput, text, notesArea, noteChip, badge, laneSel, emojiBtn, gifBtn, fxBtn, splitBtn, insertBtn, deleteBtn);
   updateNoteChip(row, card);
   updateBadge(row, card);
   return row;
@@ -1091,6 +1114,41 @@ function deleteCards(ids) {
   clearSelection();
   renderWords();
   renderTimeline();
+}
+
+// Cuts the box's text at pos: the second half becomes a new caption directly after this one, on the same timeline
+// with the same speaker. Time divides by letters, snapped to a frame. PROD NOTES stay on the first half, so a GIF
+// or effect isn't doubled. False when the cursor has nothing on one side of it.
+function splitCard(id, raw, pos) {
+  const card = cardById(id);
+  const left = raw.slice(0, pos), right = raw.slice(pos);
+  const size = (s) => s.replace(/[\s|]/g, "").length;
+  if (!card || !size(left) || !size(right)) return false;
+  const span = card.end - card.start;
+  let t = Math.round((card.start + span * size(left) / (size(left) + size(right))) * FPS) / FPS;
+  if (t <= card.start || t >= card.end) t = card.start + span / 2; // too short to land on a frame inside it
+  const before = { end: card.end, lines: card.lines, note: card.note };
+  const { _id, note, ...rest } = card;
+  const fresh = { ...rest, _id: nextId++, start: t };
+  applyEditorText(card, left);
+  applyEditorText(fresh, right);
+  card.end = t;
+  const after = { end: card.end, lines: card.lines, note: card.note };
+  const row = rowOf(id);
+  if (row) row.querySelector(".text").value = cardEditorText(card); // the box goes away next: don't let it commit the old text
+  const redraw = () => { sortCards(); clearSelection(); renderWords(); renderTimeline(); };
+  const put = (s) => { const c = cardById(id); if (c) Object.assign(c, s); };
+  state.cards.push(fresh);
+  pushUndo({
+    undo: () => { const i = idxById(fresh._id); if (i >= 0) state.cards.splice(i, 1); put(before); redraw(); },
+    redo: () => { state.cards.push(fresh); put(after); redraw(); },
+  });
+  markDirty();
+  redraw();
+  scrollRowIntoList(fresh._id, true);
+  const box = rowOf(fresh._id)?.querySelector(".text");
+  if (box) { box.focus({ preventScroll: true }); box.setSelectionRange(0, 0); }
+  return true;
 }
 
 $("#addCaptionBtn").addEventListener("click", () => insertCardAtTime(video().currentTime));
@@ -1343,7 +1401,13 @@ function closeQuickEdit() {
 }
 
 $("#quickEdit").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); saveQuickEdit(); } // else Enter also rewinds the video
+  if (e.key === "Enter" && e.ctrlKey && e.target.id === "qeText") {
+    e.preventDefault();
+    e.stopPropagation();
+    const id = qeCard._id, raw = e.target.value, pos = e.target.selectionStart;
+    saveQuickEdit();
+    splitCard(id, raw, pos);
+  } else if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); saveQuickEdit(); } // else Enter also rewinds the video
   else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeQuickEdit(); }
 });
 $("#qeSave").addEventListener("click", saveQuickEdit);
@@ -2360,7 +2424,10 @@ async function saveProject() {
       return false;
     }
   }
-  if (!(await ensureReadWrite(state.speakersHandle))) {
+  // Choosing the captions file in that dialog can empty it on disk, so the cards still get written below.
+  const speakersIsCards = await state.speakersHandle.isSameEntry(state.cardsHandle);
+  if (speakersIsCards) state.speakersHandle = null;
+  else if (!(await ensureReadWrite(state.speakersHandle))) {
     alert("Write permission for the speakers file was denied.");
     return false;
   }
@@ -2383,7 +2450,8 @@ async function saveProject() {
     }
     return out;
   });
-  const sidecar = { font: state.font, speakers: state.speakers, lanes: state.lanes, voice_overlay: state.voiceOverlay };
+  const { trims: _t, font_file: _f, ...extra } = state.sidecarExtra || {};
+  const sidecar = { ...extra, font: state.font, speakers: state.speakers, lanes: state.lanes, voice_overlay: state.voiceOverlay };
   if (state.trims.length) sidecar.trims = state.trims;
   if (state.fontFile) sidecar.font_file = state.fontFile;
 
@@ -2391,11 +2459,17 @@ async function saveProject() {
     const cardsWritable = await state.cardsHandle.createWritable();
     await cardsWritable.write(JSON.stringify(bakedCards, null, 2));
     await cardsWritable.close();
-    const spWritable = await state.speakersHandle.createWritable();
-    await spWritable.write(JSON.stringify(sidecar, null, 2));
-    await spWritable.close();
+    if (!speakersIsCards) {
+      const spWritable = await state.speakersHandle.createWritable();
+      await spWritable.write(JSON.stringify(sidecar, null, 2));
+      await spWritable.close();
+    }
   } catch (e) {
     alert("Save failed: " + e.message);
+    return false;
+  }
+  if (speakersIsCards) {
+    alert(`The speakers file can't be ${state.cardsHandle.name}, because that's your captions file. Your captions are safe, but the speakers, font and timelines weren't saved. Save again and pick a different name.`);
     return false;
   }
 

@@ -73,6 +73,20 @@ def font_names(path):
     return None
 
 
+def cards_problem(path):
+    """Why the compositor couldn't use this captions.json, or None if it's a list of cards."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            cards = json.load(f)
+    except (OSError, ValueError) as e:
+        return f"couldn't read it ({e})"
+    if not isinstance(cards, list):
+        return "it isn't a list of caption cards (it may have been overwritten by the speakers file)"
+    if not all(isinstance(c, dict) and isinstance(c.get("start"), (int, float)) and isinstance(c.get("end"), (int, float)) for c in cards):
+        return "a card has no start or end time"
+    return None
+
+
 def load_settings():
     try:
         with open(SETTINGS, encoding="utf-8") as f:
@@ -270,6 +284,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": f"Couldn't find {video} under the clip folders in settings.json."})
         if os.path.splitext(video)[0] != os.path.basename(folder) or not os.path.isfile(os.path.join(folder, "captions.json")):
             return self.send_json({"error": "The compositor needs <folder>/<folder>.mp4 next to captions.json."})
+        problem = cards_problem(os.path.join(folder, "captions.json"))
+        if problem:
+            return self.send_json({"error": f"Can't composite {os.path.basename(folder)}: {problem}."})
         with _job_lock:
             if (_job["running"] and _job["folder"] == folder) or any(f == folder for _, f in _queue):
                 return self.send_json({"error": f"{os.path.basename(folder)} is already compositing or queued."})
