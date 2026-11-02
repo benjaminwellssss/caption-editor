@@ -64,3 +64,38 @@ code assumes.
 - `normalizeSpeakers`, `applyEditorText` and `mergeRanges` were extracted and checked in Node.
 - Not done: clicking through the editor in a browser. Loading a project needs the File System Access
   API dialogs, so the `app.js` changes are reviewed and syntax-checked but not exercised end to end.
+
+---
+
+# Round 2 — the features merged after the first pass
+
+Reviewed: `1f4e14d` (composite queue, progress bar, log, notifications), `c4705e5` (FX presets, timeline
+right-click, quick edit, leaving text boxes) and `fef21f6` (♥ default font). Fixes are in the commit that
+adds this section.
+
+## Fixed
+
+| # | Where | Bug | Fix |
+|---|---|---|---|
+| 1 | `server.py` composite progress | Only the last 200 log lines were kept, and progress was recovered by scanning them for the `[step k/N]` line. One step prints far more than that (the frame counter, ffmpeg), so mid-step the bar fell to "0% starting…". Reproduced with 900 frame lines. | `note_line()` records the current step and frame fraction as lines arrive; `progress()` reads those. `GET /composite` returns `step` and the editor shows its label. |
+| 2 | `style.css` top bar | With a caption box focused, the first click on Undo, Redo, Save, Ready for composite or Open… did nothing: the box blurs on mousedown, which hides "✓ Done typing", which reflows the row so the button slides out from under the pointer before mouseup. The dirty flag appearing on that same blur had the same effect. | Both keep their space when hidden (`visibility: hidden`) instead of leaving the flow. |
+| 3 | `server.py` `run_composite` | The compositor ran under the server's own interpreter. The tray launcher falls back to plain `python` when the whisperx venv is missing, and then every composite failed on imports. | New `composite_python` setting (checked to exist at queue time); falls back to the server's interpreter. Documented in the README. |
+| 4 | `server.py` `composite_worker` | If launching the compositor raised, the worker thread died with `alive` and `running` stuck true: later clips queued but never ran and the editor polled forever. | The launch is wrapped; a failure is logged and recorded as a finished job, and the queue continues. `_finished` is capped at 50. |
+| 5 | `app.js` progress bar | `ok: null` (nothing finished yet) was rendered as "Failed (see log)", so the bar could flash red between queueing and the worker picking the job up. | Null is "Starting…"; only `ok === false` is a failure. |
+| 6 | `app.js` polling | The page-load fetch started a poll loop without checking `polling`, so a second loop could run alongside the button's. | `startPolling()` is the single entry point. |
+| 7 | `app.js` Escape | The timeline right-click menu and the FX popup stayed open on Escape. | Escape closes both. |
+
+## Noted, not changed
+
+- Quick edit pushes two undo steps when both the text and the notes change.
+- The right-click menu stays where it was if the timeline scrolls under it (its actions still target the right caption).
+- Quitting or restarting the server from the tray leaves a running compositor process to finish on its own; the fresh server knows nothing about it.
+- The import-time `assert` that tested `progress()` is gone with the rewrite; the function is now covered by the checks run while making this change, not by anything in the repo.
+
+## Verification
+
+- `node --check app.js`, `python -m py_compile server.py`.
+- `progress()` after a `[step 3/6]` line followed by 900 `frame a/b` lines and 300 ffmpeg-style lines: 0.5 (was 0.0 on `main`).
+- Worker with a queue of two where the first launch raises: first recorded as failed, second runs, worker exits cleanly.
+- Live server: `GET /composite` shape, a missing `composite_python` rejected with a message, and a fake compositor printing step and frame lines tracked to 50% mid-run and 1.0 with `ok: true` after.
+- Not clicked through in a browser; the top-bar fix is reasoned from the layout, not observed.
